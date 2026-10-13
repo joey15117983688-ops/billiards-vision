@@ -1,0 +1,9 @@
+# Direct dependencies; fixed versions for the Python 3.10 environment.
+numpy==1.26.4
+opencv-python==4.10.0.84
+PyQt5==5.15.11
+pytest==8.3.5
+torch==2.6.0
+ultralytics==8.3.203
+onnx==1.17.0
+onnxruntime==1.20.1

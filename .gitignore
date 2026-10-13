@@ -1,0 +1,16 @@
+.venv/
+.tools/
+.runtime/
+__pycache__/
+*.pyc
+.pytest_cache/
+.idea/
+.vscode/
+logs/*
+!logs/.gitkeep
+data/*
+!data/.gitkeep
+models/*.pt
+models/*.onnx
+*.log
+.DS_Store
