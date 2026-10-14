@@ -1,9 +1,11 @@
 # Environment Report
 
 验证日期：2026-10-13（Asia/Shanghai）  
-项目路径：`/Users/joey/公司产品/视觉识别项目/billiards-vision`  
+项目路径：`/Users/joey/projects/billiards-vision`
 Platform: macOS 27.0.1 / ARM64  
 阶段：第一阶段，开发环境初始化。
+
+目录迁移（2026-10-13）：项目已完整迁移到 `/Users/joey/projects/billiards-vision`，包含 Git 历史、独立 Python 运行时、虚拟环境、模型、数据、日志及本地新增文件。已修复虚拟环境中的绝对路径，迁移后 Python 3.10.20、pip、环境检查、OpenCV、PyQt5 原生窗口、YOLO、8 项 Import 测试和 pip check 全部通过。原中文项目目录已移除。
 
 ## Python
 
@@ -107,3 +109,8 @@ Environment Ready: YES
 Python 3.10.20、C++17、NumPy、OpenCV 4.10.x、PyQt5、PyTorch、YOLO、ONNX Runtime 均 PASS。
 最小项目目录、直接依赖清单、完整版本快照、README 和验证脚本均已创建。
 仅完成环境初始化；未接入 SDK、摄像头、视频流，未开发台球识别、训练或业务系统。第一阶段完成后停止。
+
+
+## 2026-10-14 接续更新
+
+CPU 台球专用模型 40 轮训练完成，最佳权重已接入现有点选窗口。SciPy 1.15.3 使用官方 macOS 12 ARM64 wheel 修复当前系统的动态库加载错误，版本保持不变。完整模型验证、实际窗口点选、11 项 pytest 和 pip check 全部通过。详见 `TRAINING_REPORT.md`。此更新覆盖上文初始化阶段“未训练／未开发台球识别”的历史描述；真实摄像头和 SDK 尚未接入。

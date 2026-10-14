@@ -11,6 +11,9 @@ logs/*
 data/*
 !data/.gitkeep
 models/*.pt
+!models/billiards_v1.pt
 models/*.onnx
 *.log
 .DS_Store
+
+runs/
