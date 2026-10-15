@@ -1,5 +1,6 @@
 """Convert audited LabelMe boxes and add reviewed table/demo-video labels."""
 from pathlib import Path
+import argparse
 import json
 import shutil
 import cv2
@@ -72,7 +73,15 @@ def write_sample(stem, image_path, boxes, split):
 
 
 def main():
-    files=sorted((DATASET/'raw').glob('*.json'))
+    global DATASET
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--white-class', action='store_true', help='Preserve whiteball as a separate third class')
+    args = parser.parse_args()
+    if args.white_class:
+        DATASET = ROOT / 'data' / 'dataset_white'
+        DATASET.mkdir(exist_ok=True)
+    raw = ROOT / 'data' / 'dataset' / 'raw'
+    files=sorted(raw.glob('*.json'))
     groups={'december':[],'february':[]}
     for p in files:groups['february' if p.stem.startswith('177') else 'december'].append(p)
     manifest=[]
@@ -85,7 +94,8 @@ def main():
             for shape in d['shapes']:
                 assert shape['shape_type']=='rectangle'
                 points=np.array(shape['points']);x1,y1=points.min(axis=0);x2,y2=points.max(axis=0)
-                boxes.append((1,[x1,y1,x2,y2]))
+                cls = 2 if args.white_class and shape['label'] == 'whiteball' else 1
+                boxes.append((cls,[x1,y1,x2,y2]))
             split='train' if index<cut else 'val'
             write_sample(p.stem,image_path,boxes,split)
             manifest.append({'stem':p.stem,'split':split,'source':group,'ball_count':len(boxes)-1,'table_box':boxes[0][1]})
@@ -113,7 +123,7 @@ def main():
     cv2.imwrite(str(DATASET/'supplemental_review.jpg'),np.vstack([np.hstack(previews[i:i+3]) for i in range(0,12,3)]))
     padded=table_previews+[np.zeros_like(table_previews[0]) for _ in range((-len(table_previews))%7)]
     cv2.imwrite(str(DATASET/'table_labels_review.jpg'),np.vstack([np.hstack(padded[i:i+7]) for i in range(0,len(padded),7)]))
-    (DATASET/'data.yaml').write_text(yaml.safe_dump({'path':str(DATASET),'train':'images/train','val':'images/val','names':{0:'billiards_table',1:'billiard_ball'}},sort_keys=False))
+    (DATASET/'data.yaml').write_text(yaml.safe_dump({'path':str(DATASET),'train':'images/train','val':'images/val','names':({0:'billiards_table',1:'billiard_ball',2:'white_ball'} if args.white_class else {0:'billiards_table',1:'billiard_ball'})},sort_keys=False))
     (DATASET/'split_manifest.json').write_text(json.dumps(manifest,indent=2))
     print('train',sum(m['split']=='train' for m in manifest),'val',sum(m['split']=='val' for m in manifest),'balls',sum(m['ball_count'] for m in manifest))
     print('Supplemental ball counts:',[(m['stem'],m['ball_count']) for m in manifest if m['source']=='demo_video'])

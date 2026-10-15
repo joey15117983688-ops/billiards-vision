@@ -1,4 +1,4 @@
-"""Chinese display names for the official model's COCO detection classes."""
+"""Chinese display names for billiards and legacy COCO detection classes."""
 COCO_LABELS_ZH = {
     "person": "人", "bicycle": "自行车", "car": "汽车", "motorcycle": "摩托车",
     "airplane": "飞机", "bus": "公交车", "train": "火车", "truck": "卡车",
@@ -27,5 +27,5 @@ COCO_LABELS_ZH = {
 
 
 def chinese_label(name):
-    billiards = {"billiards_table": "台球桌", "billiard_ball": "台球"}
+    billiards = {"billiards_table": "台球桌", "billiard_ball": "台球", "white_ball": "白球", "black_ball": "黑球"}
     return billiards.get(name, COCO_LABELS_ZH.get(name, "未知类别"))

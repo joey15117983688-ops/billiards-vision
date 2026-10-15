@@ -11,5 +11,5 @@ if [[ ! -x "$PYTHON" ]]; then
 fi
 
 cd "$PROJECT_DIR"
-echo "启动本地台球球桌视频（关闭窗口即可退出）"
+echo "启动台球视觉识别（默认样本图片，可切换视频；关闭窗口即可退出）"
 exec "$PYTHON" "$PROJECT_DIR/main.py" "$@"

@@ -114,3 +114,8 @@ Python 3.10.20、C++17、NumPy、OpenCV 4.10.x、PyQt5、PyTorch、YOLO、ONNX R
 ## 2026-10-14 接续更新
 
 CPU 台球专用模型 40 轮训练完成，最佳权重已接入现有点选窗口。SciPy 1.15.3 使用官方 macOS 12 ARM64 wheel 修复当前系统的动态库加载错误，版本保持不变。完整模型验证、实际窗口点选、11 项 pytest 和 pip check 全部通过。详见 `TRAINING_REPORT.md`。此更新覆盖上文初始化阶段“未训练／未开发台球识别”的历史描述；真实摄像头和 SDK 尚未接入。
+
+
+## 2026-10-14 白球及低内存训练更新
+
+完成 20 轮全图微调及 15 轮白球局部图强化，CPU、batch=2；采样 RSS 峰值约 1.59／1.41 GiB，未出现内存不足。新三类模型已接入点选窗口。17 个验证白球全部匹配、无额外白球误检；录像 6 帧及窗口点选验收通过。12 项 pytest、pip check 通过。详见 `TRAINING_REPORT.md`、`LOW_MEMORY_TRAINING.md`。
