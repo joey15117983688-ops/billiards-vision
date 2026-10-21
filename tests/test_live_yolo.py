@@ -42,6 +42,7 @@ def app():return QApplication.instance() or QApplication([])
 def test_running_video_queues_only_one_request_and_rejects_stale_source(app):
     window=MainWindow();requests=[]
     try:
+        window.play_button.click()
         assert window.timer.isActive()
         window.yolo_ready=True
         window.live_requested.connect(lambda frame,token:requests.append(token))
@@ -62,6 +63,7 @@ def test_running_video_queues_only_one_request_and_rejects_stale_source(app):
 def test_live_click_uses_overlay_without_pausing_or_new_inference(app):
     window=MainWindow()
     try:
+        window.play_button.click()
         window.yolo_ready=True;window.detection_mode="all";window.yolo_button.setChecked(True)
         item={'name':'black_ball','box':[460,250,480,270],'confidence':.9,'track_id':17}
         window.live_tracking.detections=[item];window.canvas.set_detections([item])
@@ -76,6 +78,7 @@ def test_live_click_uses_overlay_without_pausing_or_new_inference(app):
 def test_enabling_yolo_without_all_or_selection_does_not_start_inference(app):
     window=MainWindow();requests=[]
     try:
+        window.play_button.click()
         window.yolo_ready=True;window.live_requested.connect(lambda frame,token:requests.append(token))
         window.yolo_button.setChecked(True)
         for _ in range(5):window.next_frame()

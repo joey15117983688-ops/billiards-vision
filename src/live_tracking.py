@@ -4,6 +4,7 @@ from copy import deepcopy
 import cv2
 import numpy as np
 from .ball_tracks import BallTracks
+from .ball_observation import BALL_NAMES, closest_ball
 
 
 class LiveTracking:
@@ -13,9 +14,10 @@ class LiveTracking:
         self.next_id=1
         self.identities=BallTracks()
         self.current_color=None
+        self.monitored_ids=set()
 
     def clear(self,keep_tracks=False):
-        self.frames.clear();self.detections=[];self.current_color=None
+        self.frames.clear();self.detections=[];self.current_color=None;self.monitored_ids.clear()
         if not keep_tracks:self.identities=BallTracks()
 
     @staticmethod
@@ -25,25 +27,71 @@ class LiveTracking:
         return cv2.cvtColor(small,cv2.COLOR_BGR2GRAY),scale,frame.shape[:2],small
 
     def push(self,frame_id,frame):
-        gray,scale,shape,self.current_color=self.gray(frame)
+        gray,scale,shape,small=self.gray(frame)
+        self.current_color=frame
+        for item in self.detections:
+            state=self.identities.states.get(item.get('track_id'))
+            if state is not None:
+                item['_velocity']=state['velocity'].tolist()
+                if state['appearance'] is not None:item['_appearance']=state['appearance'].tolist()
         if self.frames:
-            _,previous,old_scale,old_shape=self.frames[-1]
+            _,previous,old_scale,old_shape,*_=self.frames[-1]
             if old_shape==shape:
-                self.detections=self.flow(previous,gray,self.detections,scale,shape)
+                self.detections=self.flow(previous,gray,self.detections,scale,shape,frame)
             else:self.detections=[];self.frames.clear()
-        self.detections=self.identities.update(frame_id,self.current_color,self.detections,scale)
-        self.frames.append((frame_id,gray,scale,shape))
+        seen={d.get('track_id') for d in self.detections}
+        for key in self.monitored_ids-seen:
+            state=self.identities.states.get(key)
+            if state is None:continue
+            dt=frame_id-state['frame']
+            if not 0<dt<=self.identities.max_age:continue
+            position=state['center']+state['velocity']*min(dt,12);half=state['size']/2
+            proposal={'name':state['name'],'box':[*(position-half),*(position+half)],
+                      'selection_id':key,'confidence':.7,'_appearance':None if state['appearance'] is None else state['appearance'].tolist()}
+            proposal['_allow_motion_blur']=np.linalg.norm(state['velocity'])>state['size']*.35
+            observed=closest_ball(frame,proposal,3.5)
+            if observed is None:
+                position=state['center']
+                proposal['box']=[*(position-half),*(position+half)]
+                observed=closest_ball(frame,proposal,3.5)
+            if observed:self.detections.append(observed)
+        for item in self.detections:
+            if item.get('_ball_observed') and item.get('track_id') in self.identities.states:
+                item['selection_id']=item['track_id']
+        self.detections=self.identities.update(frame_id,self.current_color,self.detections)
+        self.frames.append((frame_id,gray,scale,shape,small.copy()))
         return deepcopy(self.detections)
 
     @staticmethod
-    def flow(previous,current,items,scale,shape):
+    def patch_offset(previous,current,item,scale):
+        x1,y1,x2,y2=np.asarray(item['box'])*scale
+        ax,ay=max(0,int(x1)-2),max(0,int(y1)-2)
+        bx,by=min(previous.shape[1],int(x2)+3),min(previous.shape[0],int(y2)+3)
+        template=previous[ay:by,ax:bx]
+        if min(template.shape,default=0)<5 or float(template.std())<5:return None
+        radius=max(12,int(max(x2-x1,y2-y1)*6))
+        sx,sy=max(0,ax-radius),max(0,ay-radius)
+        ex,ey=min(current.shape[1],bx+radius),min(current.shape[0],by+radius)
+        scores=cv2.matchTemplate(current[sy:ey,sx:ex],template,cv2.TM_CCOEFF_NORMED)
+        _,peak,_,location=cv2.minMaxLoc(scores)
+        if peak<.65:return None
+        # Two equally good, separate balls are not enough identity evidence.
+        x,y=location;radius=max(3,min(template.shape)//2)
+        scores[max(0,y-radius):y+radius+1,max(0,x-radius):x+radius+1]=-1
+        if float(scores.max())>peak-.04:return None
+        return (np.asarray(location)+[sx-ax,sy-ay])/scale
+
+    @staticmethod
+    def flow(previous,current,items,scale,shape,color=None):
         output=deepcopy(items);points=[];owners=[]
         for i,item in enumerate(output):
-            if item['name']=='billiards_table':continue
+            if item['name'] not in BALL_NAMES:continue
             x1,y1,x2,y2=np.array(item['box'])*scale
             ax,ay=max(0,int(x1)),max(0,int(y1));bx,by=min(current.shape[1],int(x2)+1),min(current.shape[0],int(y2)+1)
             if bx<=ax or by<=ay:continue
-            features=cv2.goodFeaturesToTrack(previous[ay:by,ax:bx],maxCorners=6,qualityLevel=.02,minDistance=2)
+            yy,xx=np.indices((by-ay,bx-ax));cx,cy=(x1+x2)/2,(y1+y2)/2
+            mask=(((xx+ax-cx)**2+(yy+ay-cy)**2)<(.45*min(x2-x1,y2-y1))**2).astype(np.uint8)*255
+            features=cv2.goodFeaturesToTrack(previous[ay:by,ax:bx],mask=mask,maxCorners=8,qualityLevel=.02,minDistance=2)
             if features is None:continue
             for point in features[:,0]+[ax,ay]:points.append(point);owners.append(i)
         valid_offsets={}
@@ -58,12 +106,33 @@ class LiveTracking:
         keep=[]
         for i,item in enumerate(output):
             if item['name']=='billiards_table':keep.append(item);continue
+            if item['name'] not in BALL_NAMES:continue
+            original=deepcopy(item)
+            original['_reject_ambiguous']=True
+            # A small feature window can follow the cloth when a ball moves
+            # several diameters. Match its image patch over a wider local area.
+            near=closest_ball(color,original,1.2) if color is not None else None
+            stationary=(near is not None and np.linalg.norm(np.mean(np.asarray(near['box']).reshape(2,2),axis=0)-np.mean(np.asarray(original['box']).reshape(2,2),axis=0))<max(original['box'][2]-original['box'][0],original['box'][3]-original['box'][1])*.2)
+            patch=None if stationary else LiveTracking.patch_offset(previous,current,item,scale)
+            if patch is not None:valid_offsets[i]=[patch]
             if i in valid_offsets:
                 dx,dy=np.median(valid_offsets[i],axis=0)
                 x1,y1,x2,y2=item['box']
                 item['box']=[float(x1+dx),float(y1+dy),float(x2+dx),float(y2+dy)]
                 item['_flow_misses']=0
             else:item['_flow_misses']=item.get('_flow_misses',0)+1
+            if color is not None:
+                item['_allow_motion_blur']=np.linalg.norm(np.mean(np.asarray(item['box']).reshape(2,2),axis=0)-np.mean(np.asarray(original['box']).reshape(2,2),axis=0))>max(original['box'][2]-original['box'][0],original['box'][3]-original['box'][1])*.35
+                observed=closest_ball(color,item,1.8)
+                if observed is None:
+                    # Measure pixels near the motion prediction, not a line
+                    # extrapolated through an occluder.
+                    velocity=np.asarray(original.get('_velocity',[0.,0.]))
+                    proposal={**original,'box':(np.asarray(original['box'])+np.tile(velocity,2)).tolist(),
+                              '_allow_motion_blur':True}
+                    observed=closest_ball(color,proposal,4.)
+                if observed is None:continue
+                item=observed;item['_flow_misses']=0
             x1,y1,x2,y2=item['box']
             if item['_flow_misses']<=3 and 0<=(x1+x2)/2<shape[1] and 0<=(y1+y2)/2<shape[0]:keep.append(item)
         table=next((d for d in keep if d['name']=='billiards_table' and d.get('polygon')),None)
@@ -77,9 +146,15 @@ class LiveTracking:
         history=list(self.frames)
         index=next((i for i,f in enumerate(history) if f[0]==frame_id),None)
         if index is None:return False
-        aligned=deepcopy(items)
+        aligned=[{**deepcopy(d),'_alignment_index':i} for i,d in enumerate(items)]
+        measured={i:[(frame_id,np.mean(np.asarray(d['box']).reshape(2,2),axis=0))] for i,d in enumerate(items) if d['name'] in BALL_NAMES}
         for before,after in zip(history[index:],history[index+1:]):
-            aligned=self.flow(before[1],after[1],aligned,after[2],after[3])
+            small_items=[{**d,'box':(np.asarray(d['box'])*after[2]).tolist()} for d in aligned]
+            small_items=self.flow(before[1],after[1],small_items,1.,after[1].shape,after[4])
+            aligned=[{**d,'box':(np.asarray(d['box'])/after[2]).tolist()} for d in small_items]
+            for d in aligned:
+                if d['name'] in BALL_NAMES and d.get('_ball_observed'):
+                    measured[d['_alignment_index']].append((after[0],np.mean(np.asarray(d['box']).reshape(2,2),axis=0)))
         used=set()
         for item in aligned:
             if item.get("selection_id") is not None:
@@ -95,5 +170,23 @@ class LiveTracking:
             if choices:item['track_id']=min(choices,key=lambda pair:pair[0])[1]['track_id']
             else:item['track_id']=self.next_id;self.next_id+=1
             used.add(item['track_id'])
-        self.detections=self.identities.update(history[-1][0],self.current_color,aligned,history[-1][2])
+        end_frame=history[-1][0]
+        before_paths={k:(state['frame'],list(state['path'])) for k,state in self.identities.states.items()}
+        self.detections=self.identities.update(end_frame,self.current_color,aligned)
+        for d in self.detections:
+            if d['name'] not in BALL_NAMES:continue
+            key=d['track_id'];points=measured.get(d.get('_alignment_index'),[])
+            if key in self.identities.states and len(points)>1:
+                last,prior=before_paths.get(key,(frame_id-1,[]))
+                # Never rewrite observations that were already tracked live.
+                if last>=end_frame:continue
+                recovered=[(f,p) for f,p in points if f>last]
+                if len(recovered)<2:continue
+                for f,p in recovered:
+                    gap=bool(prior) and f-last>1
+                    if not prior or np.linalg.norm(p-prior[-1][:2])>=1 or gap:
+                        prior.append((float(p[0]),float(p[1]),gap))
+                    last=f
+                self.identities.states[key]['path']=deque(prior,maxlen=self.identities.max_points)
+        self.monitored_ids.update(d['track_id'] for d in self.detections if d['name'] in BALL_NAMES)
         return True

@@ -177,3 +177,20 @@ def test_blue_cloth_does_not_merge_green_surroundings_into_table():
     corners=np.array(result.table.corners)
     assert corners[:,0].min()>180 and corners[:,0].max()<1020
     assert corners[:,1].min()>180 and corners[:,1].max()<620
+
+
+@pytest.mark.parametrize('brightness',[.55,1.,1.5])
+def test_reported_portrait_frame_excludes_rails_and_finds_both_side_pockets(brightness):
+    from pathlib import Path
+    frame=cv2.imread(str(Path(__file__).parent/'fixtures/calibration_portrait.png'))
+    frame=np.clip(frame.astype(float)*brightness,0,255).astype(np.uint8)
+    result=PocketDetector().detect(frame)
+    corners=np.array(result.table.playable_polygon)
+    assert np.all((corners[[0,3],0]>78)&(corners[[0,3],0]<98)),corners
+    assert np.all((corners[[1,2],0]>592)&(corners[[1,2],0]<615)),corners
+    if brightness==1.:
+        assert result.valid,[(p.id,p.status) for p in result.pockets]
+        for anchor in ([71,611],[619,609]):
+            assert min(np.linalg.norm(np.array(p.center)-anchor) for p in result.pockets)<12
+    # Exposure changes need not make every pocket visually verifiable; never
+    # promote an estimate merely because the table edges were fitted.

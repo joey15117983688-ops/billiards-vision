@@ -14,9 +14,10 @@ class PocketDetector:
         self.table_detector=TableDetector(self.config)
         self.validator=PocketValidator(self.config)
 
-    def detect(self, frame):
+    def detect(self, frame, table=None):
+        """Validate pockets, optionally reusing a freshly fitted table from this frame."""
         start=time.perf_counter()
-        table=self.table_detector.detect(frame)
+        table=self.table_detector.detect(frame) if table is None else table
         height,width=frame.shape[:2] if isinstance(frame,np.ndarray) and frame.ndim>=2 else (0,0)
         result=PocketDetectionResult(width,height,table,[PocketResult(name,reasons=['table_geometry_unavailable']) for name in CANDIDATES])
         result.table_mask=np.zeros((height,width),np.uint8)

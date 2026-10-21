@@ -101,69 +101,74 @@ class TableDetector:
                 coverages.append(float(np.mean(coverage)))
             scope_corners=[_intersection(lines[i-1],lines[i]) for i in range(4)]
             if any(point is None for point in scope_corners):scope_corners=quad.copy()
-            # A green cushion can merge with the cloth all the way to the crop.
-            # Recover long inner-cushion edges from image evidence instead of fitting
-            # the artificial contour along the image border.
-            if clipped:
-                segments=cv2.HoughLinesP(edges,1,np.pi/720,threshold=45,
-                                        minLineLength=max(35,int(.20*min(pair))),maxLineGap=18)
-                if segments is not None:
-                    for i in range(4):
-                        a,b=quad[i],quad[(i+1)%4];direction=b-a
-                        length=np.linalg.norm(direction);unit=direction/length
-                        normal=np.array([-unit[1],unit[0]])
-                        choices=[]
-                        for raw in segments[:,0]:
-                            u,v=raw[:2].astype(float),raw[2:].astype(float)
-                            delta=v-u;extent=np.linalg.norm(delta)
-                            if extent<.18*length or abs(delta@unit)/extent<.9995:continue
-                            midpoint=(u+v)/2;along=(midpoint-a)@unit/length
-                            inward=(midpoint-a)@normal
-                            if not .12<along<.88 or not 2<inward<.12*min(pair):continue
-                            # The adjacent segment must lie inside the cloth rectangle.
-                            # Rank continuous cushion transitions, not weak cloth
-                            # texture or the outer edge of a printed rail.
-                            line=_line(u,v)
-                            sample=a+np.linspace(.15,.85,100)[:,None]*direction
-                            sample-=((sample@line[:2]+line[2])[:,None])*line[:2]
+            # Colour contours can include cushions even on fully visible tables.
+            # Always look for supported inner transitions; a frame-border test
+            # cannot distinguish a playing surface from its surrounding rails.
+            segments=cv2.HoughLinesP(edges,1,np.pi/720,threshold=45,
+                                    minLineLength=max(35,int(.20*min(pair))),maxLineGap=18)
+            if segments is not None:
+                for i in range(4):
+                    a,b=quad[i],quad[(i+1)%4];direction=b-a
+                    length=np.linalg.norm(direction);unit=direction/length
+                    normal=np.array([-unit[1],unit[0]])
+                    choices=[]
+                    for raw in segments[:,0]:
+                        u,v=raw[:2].astype(float),raw[2:].astype(float)
+                        delta=v-u;extent=np.linalg.norm(delta)
+                        if extent<.18*length or abs(delta@unit)/extent<.9995:continue
+                        midpoint=(u+v)/2;along=(midpoint-a)@unit/length
+                        inward=(midpoint-a)@normal
+                        if not .12<along<.88 or not 2<inward<.12*min(pair):continue
+                        # The adjacent segment must lie inside the cloth rectangle.
+                        # Rank continuous cushion transitions, not weak cloth
+                        # texture or the outer edge of a printed rail.
+                        line=_line(u,v)
+                        sample=a+np.linspace(.15,.85,100)[:,None]*direction
+                        sample-=((sample@line[:2]+line[2])[:,None])*line[:2]
+                        values=[]
+                        for offset in (-4,0,4):
+                            q=np.rint(sample+offset*normal).astype(int)
+                            q[:,0]=np.clip(q[:,0],0,w-1);q[:,1]=np.clip(q[:,1],0,h-1)
+                            values.append(normalized_value[q[:,1],q[:,0]].astype(float))
+                        transition=float(np.median(np.abs(values[0]-values[2])))
+                        ridge=float(np.median((values[0]+values[2])/2-values[1]))
+                        strength=max(transition,2*ridge)
+                        if strength<8:continue
+                        choices.append((inward, strength, u, v))
+                    if choices:
+                        strongest=max(item[1] for item in choices)
+                        # Inner seams can be much fainter than the outer black rail,
+                        # especially under clipping/exposure changes. Retain supported
+                        # weaker long seams before choosing the innermost boundary.
+                        # Oblique views have broad cushion shadows that can mimic
+                        # an interior seam. Use the conservative contrast gate there.
+                        near_overhead=not clipped and max(abs(angle-90) for angle in angles)<3
+                        supported=[item for item in choices if item[1]>=max(8,strongest*(.20 if near_overhead else .55))]
+                        _,_,u,v=max(supported,key=lambda item:item[0])
+                        seed=_line(u,v)
+                        samples=a+np.linspace(.12,.88,100)[:,None]*direction
+                        samples-=((samples@seed[:2]+seed[2])[:,None])*seed[:2]
+                        offsets=np.arange(-max(3,int(.02*min(pair))),max(3,int(.02*min(pair)))+1)
+                        responses=[]
+                        for offset in offsets:
                             values=[]
-                            for offset in (-4,0,4):
-                                q=np.rint(sample+offset*normal).astype(int)
+                            for side in (-3,3):
+                                q=np.rint(samples+(offset+side)*normal).astype(int)
                                 q[:,0]=np.clip(q[:,0],0,w-1);q[:,1]=np.clip(q[:,1],0,h-1)
                                 values.append(normalized_value[q[:,1],q[:,0]].astype(float))
-                            transition=float(np.median(np.abs(values[0]-values[2])))
-                            ridge=float(np.median((values[0]+values[2])/2-values[1]))
-                            strength=max(transition,2*ridge)
-                            if strength<8:continue
-                            choices.append((inward, strength, u, v))
-                        if choices:
-                            strongest=max(item[1] for item in choices)
-                            supported=[item for item in choices if item[1]>=max(8,strongest*.55)]
-                            _,_,u,v=max(supported,key=lambda item:item[0])
-                            seed=_line(u,v)
-                            samples=a+np.linspace(.12,.88,100)[:,None]*direction
-                            samples-=((samples@seed[:2]+seed[2])[:,None])*seed[:2]
-                            offsets=np.arange(-max(3,int(.02*min(pair))),max(3,int(.02*min(pair)))+1)
-                            responses=[]
-                            for offset in offsets:
-                                values=[]
-                                for side in (-3,3):
-                                    q=np.rint(samples+(offset+side)*normal).astype(int)
-                                    q[:,0]=np.clip(q[:,0],0,w-1);q[:,1]=np.clip(q[:,1],0,h-1)
-                                    values.append(normalized_value[q[:,1],q[:,0]].astype(float))
-                                responses.append(values[1]-values[0])
-                            responses=np.array(responses)
-                            best=np.argmax(responses,axis=0)
-                            strength=responses[best,np.arange(len(samples))]
-                            supported=strength>=max(8,float(np.median(strength))*.5)
-                            refined=samples+offsets[best,None]*normal
-                            if np.count_nonzero(supported)>=40:
-                                vx,vy,cx,cy=cv2.fitLine(refined[supported].astype(np.float32),cv2.DIST_HUBER,0,.01,.01).ravel()
-                                fit=np.array([vy,-vx,vx*cy-vy*cx],float)
-                                lines[i]=fit
-                            else:
-                                lines[i]=seed
-                            sources[i]='cushion_image_line_fit'
+                            responses.append(values[1]-values[0])
+                        responses=np.array(responses)
+                        best=np.argmax(responses,axis=0)
+                        strength=responses[best,np.arange(len(samples))]
+                        supported=strength>=max(8,float(np.median(strength))*.5)
+                        refined=samples+offsets[best,None]*normal
+                        if np.count_nonzero(supported)>=40:
+                            vx,vy,cx,cy=cv2.fitLine(refined[supported].astype(np.float32),cv2.DIST_HUBER,0,.01,.01).ravel()
+                            fit=np.array([vy,-vx,vx*cy-vy*cx],float)
+                            lines[i]=fit
+                        else:
+                            lines[i]=seed
+                        sources[i]='cushion_image_line_fit'
             fitted=[_intersection(lines[i-1],lines[i]) for i in range(4)]
             if all(p is not None for p in fitted) and max(np.linalg.norm(np.array(fitted)-quad,axis=1))<.16*min(pair):
                 quad=np.array(fitted)
@@ -202,6 +207,12 @@ class TableDetector:
             # Keep the inner-cushion plane unchanged for homography and pocket checks.
             scope=cv2.convexHull(np.vstack([np.array(scope_corners),quad]).astype(np.float32)).reshape(-1,2)/scale
             result.scope_polygon=scope.astype(float).tolist()
+            from src.cloth_region import cloth_region
+            connected=cloth_region(frame,corners)
+            if connected:
+                result.scope_polygon=connected['polygon']
+                result.quality['scope_color_fill']=connected['color_fill']
+                result.quality['scope_connected_coverage']=connected['connected_color_coverage']
             candidates.append(result)
         if not candidates:
             return TableResult(reasons=list(dict.fromkeys(rejection)) or ['no_plausible_cloth_region'])

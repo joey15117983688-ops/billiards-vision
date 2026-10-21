@@ -17,3 +17,7 @@ models/*.onnx
 .DS_Store
 
 runs/
+
+# Local venue calibrations and training annotations
+/config/calibration/
+/config/venues/

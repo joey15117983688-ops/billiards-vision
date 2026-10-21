@@ -82,7 +82,7 @@ def test_scene_reports_table_when_model_has_no_table_proposal():
     assert found[0]['method']=='cloth_geometry'
 
 
-def test_user_restored_cushion_band_is_in_scope_but_not_physical_plane():
+def test_same_color_cushion_band_is_in_recognition_but_outside_coordinate_plane(monkeypatch):
     from pathlib import Path
     import pytest
     from src.vision.pocket import TableDetector
@@ -95,9 +95,11 @@ def test_user_restored_cushion_band_is_in_scope_but_not_physical_plane():
     assert TableCoordinates(table.playable_polygon).millimetres(905,240) is None
     raw=[{'name':'billiard_ball','box':[898,234,910,246],'confidence':.9},
          {'name':'billiard_ball','box':[940,234,952,246],'confidence':.9}]
+    # Isolate scope filtering from the independent image-shape validation.
+    monkeypatch.setattr('src.target_balls.closest_ball',lambda frame,item,radius_factor:item)
     found=scene_detections(frame,raw)
     assert any(d['name']=='billiard_ball' and d['box']==raw[0]['box'] for d in found)
     assert not any(d.get('box')==raw[1]['box'] for d in found)
-    assert found[0]['geometry']=='table_scope'
+    assert found[0]['geometry']=='connected_cloth_scope'
     payload=table.to_dict()
     assert payload['scope_polygon'] and payload['playable_polygon']

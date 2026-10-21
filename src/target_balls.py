@@ -2,6 +2,7 @@
 import cv2
 import numpy as np
 from src.vision.pocket import TableDetector
+from src.ball_observation import closest_ball
 
 
 def playing_surface(frame):
@@ -71,21 +72,42 @@ def target_balls(frame, detections=(), polygon=None):
     return [max(items,key=lambda item:item['confidence']) for items in candidates.values() if items]
 
 
-def scene_detections(frame, detections):
+def scene_detections(frame, detections, calibration_polygon=None, scope_polygon=None):
     """Keep the table and all on-table balls, refining only black/white labels."""
-    table=TableDetector().detect(frame)
+    if calibration_polygon is not None:
+        from src.table_coordinates import TableCoordinates
+        from src.vision.pocket.models import TableResult
+        polygon=TableCoordinates(calibration_polygon).corners.tolist()
+        table=TableResult(detected=True,playable_polygon=polygon,scope_polygon=polygon,
+                          quality={'geometry_reliable':True})
+    else:
+        table=TableDetector().detect(frame)
     if not table.detected or not table.quality.get('geometry_reliable'):
         return []
-    polygon=table.scope_polygon or table.playable_polygon
+    inner_polygon=table.playable_polygon
+    from src.cloth_region import cloth_region
+    region=None if scope_polygon is not None else cloth_region(frame,inner_polygon)
+    polygon=scope_polygon if scope_polygon is not None else region['polygon'] if region else inner_polygon
     points = np.array(polygon,np.float32)
     mask = surface_mask(frame,polygon)
-    special = target_balls(frame,detections,table.playable_polygon)
+    special = target_balls(frame,detections,polygon)
     table_scores = [item['confidence'] for item in detections if item['name']=='billiards_table']
     table = {'name':'billiards_table','confidence':max(table_scores) if table_scores else .8,
              'box':[float(points[:,0].min()),float(points[:,1].min()),
                     float(points[:,0].max()),float(points[:,1].max())],
-             'polygon':polygon,'playable_polygon':table.playable_polygon,'geometry':'table_scope',
+             'polygon':polygon,'playable_polygon':inner_polygon,'geometry':'connected_cloth_scope',
+             'scope_evidence':region,
              'method':'yolo_and_cloth_geometry' if table_scores else 'cloth_geometry'}
+    if calibration_polygon is None:
+        # Verify a first automatic result before the UI locks/persists its plane.
+        from src.adaptive_calibration import evaluate_candidate,ImageEvidence
+        from src.vision.pocket import PocketConfig
+        try:
+            evidence=evaluate_candidate(frame,inner_polygon,ImageEvidence(frame),PocketConfig())
+            if evidence['metrics']['reliable'] and evidence['metrics']['observed']==6:
+                evidence['pockets']['table']['scope_polygon']=polygon
+                table['calibration_evidence']=evidence
+        except (ValueError,cv2.error):pass
     balls = []
     def overlap(a,b):
         x1,y1=max(a[0],b[0]),max(a[1],b[1])
@@ -95,6 +117,11 @@ def scene_detections(frame, detections):
     for item in detections:
         if item['name'] not in ('billiard_ball','white_ball','black_ball'):continue
         x1,y1,x2,y2=item['box'];center=((x1+x2)/2,(y1+y2)/2)
+        if min(x2-x1,y2-y1)<=0 or max(x2-x1,y2-y1)/min(x2-x1,y2-y1)>1.8:continue
+        rounded=closest_ball(frame,item,1.2)
+        if rounded is None:continue
+        rc=np.mean(np.array(rounded['box']).reshape(2,2),axis=0)
+        if np.linalg.norm(rc-np.array(center))>.6*max(x2-x1,y2-y1):continue
         if cv2.pointPolygonTest(points,center,False)<0:continue
         ax,ay=max(0,int(x1)),max(0,int(y1))
         bx,by=min(frame.shape[1],int(np.ceil(x2))),min(frame.shape[0],int(np.ceil(y2)))

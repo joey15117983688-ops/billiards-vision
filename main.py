@@ -3,6 +3,8 @@ import argparse
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import json
+import hashlib
+from copy import deepcopy
 import time
 from collections import deque
 import subprocess
@@ -15,7 +17,7 @@ import cv2
 from PyQt5.QtCore import QObject, QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPen, QPolygonF, QKeySequence
 from PyQt5.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QMainWindow, QPushButton, QShortcut, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QInputDialog, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QMainWindow, QPushButton, QShortcut, QVBoxLayout, QWidget,
 )
 from src.yolo_labels import chinese_label
 from src.table_coordinates import TableCoordinates, TableDimensions
@@ -23,11 +25,13 @@ from src.live_tracking import LiveTracking
 from src.track_recording import TrackRecorder
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_VIDEO = ROOT / "data" / "overhead_pool.mp4"
+DEFAULT_VIDEO = ROOT / "data" / "test.mp4"
+if not DEFAULT_VIDEO.is_file():DEFAULT_VIDEO = ROOT / "data" / "overhead_pool.mp4"
 DEFAULT_IMAGES = ROOT / "data" / "dataset" / "images" / "train"
 
 
 class YoloWorker(QObject):
+    geometry_ready = pyqtSignal(int, object)
     ready = pyqtSignal()
     result = pyqtSignal(int, str, float, object, object)
     all_result = pyqtSignal(int, object)
@@ -39,6 +43,8 @@ class YoloWorker(QObject):
         super().__init__()
         self.process = None
         self.log = None
+        self.calibration_polygon = None
+        self.scope_polygon = None
 
     def read_reply(self):
         line = self.process.stdout.readline()
@@ -74,7 +80,7 @@ class YoloWorker(QObject):
             with tempfile.NamedTemporaryFile(dir=ROOT / "logs", suffix=".npy", delete=False) as f:
                 np.save(f, frame, allow_pickle=False)
                 path = Path(f.name)
-            self.process.stdin.write(json.dumps({"frame": str(path), **options}) + "\n")
+            self.process.stdin.write(json.dumps({"frame": str(path), "calibration_polygon": self.calibration_polygon, "scope_polygon": self.scope_polygon or self.calibration_polygon, **options}) + "\n")
             self.process.stdin.flush()
             return self.read_reply()
         finally:
@@ -85,6 +91,8 @@ class YoloWorker(QObject):
     def identify(self, frame, x, y, generation):
         try:
             reply = self.request_prediction(frame, {"x": x, "y": y})
+            geometry=reply.get("scene_geometry") or (reply if reply.get("calibration_evidence") else None)
+            if geometry is not None:self.geometry_ready.emit(generation,geometry)
             self.result.emit(generation, reply["name"], reply["confidence"], reply.get("box"), reply.get("polygon"))
         except Exception as exc:
             self.failed.emit(generation, str(exc))
@@ -150,14 +158,65 @@ class PocketWorker(QObject):
             self.failed.emit(generation, str(exc))
 
 
+class CalibrationWorker(QObject):
+    progress = pyqtSignal(int, str)
+    done = pyqtSignal(int, object, object)
+    failed = pyqtSignal(int, str)
+
+    @pyqtSlot(object, int, object)
+    def run(self, fallback, generation, source):
+        try:
+            from src.scene_calibration import calibrate_scene
+            self.progress.emit(generation, "1/4 重新读取当前画面…")
+            if source['kind']=='image':
+                frame=cv2.imread(source['path'])
+            else:
+                capture=cv2.VideoCapture(source['path'])
+                try:
+                    capture.set(cv2.CAP_PROP_POS_FRAMES,source['frame_index'])
+                    ok,frame=capture.read()
+                    if not ok:frame=None
+                finally:
+                    capture.release()
+            if frame is None:
+                raise ValueError('重新读取画面失败，请检查视频或图片来源')
+            sample_path=None;sample_error=None
+            if source.get('collect_training_sample') and source.get('manual_profile') is not None:
+                try:
+                    from src.calibration_samples import save_calibration_sample
+                    metadata={key:value for key,value in source.items() if key not in ('manual_profile','collect_training_sample')}
+                    sample_path=str(save_calibration_sample(ROOT/'data'/'calibration_samples',frame,source['manual_profile'],metadata))
+                except (OSError,ValueError,TypeError,cv2.error) as exc:
+                    sample_error=str(exc)
+            result=calibrate_scene(frame, None,
+                                   lambda message:self.progress.emit(generation,message),source.get("manual_profile"),
+                                   source.get("correction_context"), geometry_only=True)
+            result['learning_sample']=sample_path
+            result['learning_sample_error']=sample_error
+            result['pockets']['source']=source
+            self.done.emit(generation,frame,result)
+        except Exception as exc:
+            self.failed.emit(generation,str(exc))
+
+
 class VideoCanvas(QWidget):
+    fullscreen_requested = pyqtSignal()
+    pockets_available = pyqtSignal(bool)
     element_clicked = pyqtSignal(object, float, float)
     coordinate_hovered = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.rotate_portrait=False
+        self.fullscreen_button=QPushButton("旋转放大",self)
+        self.fullscreen_button.setMinimumSize(110,44)
+        self.fullscreen_button.setToolTip("竖屏顺时针旋转并适配当前视频区域；再次点击或按 Esc 恢复")
+        self.fullscreen_button.clicked.connect(self.fullscreen_requested)
         self.image = QImage()
         self.frame = None
+        self.calibration_polygon = None
+        self.recognition_polygon = None
+        self.exam_circles=[]
         self.coordinate_mode = False
         self.coordinates = None
         self.dimensions = TableDimensions()
@@ -170,7 +229,9 @@ class VideoCanvas(QWidget):
         self.detections = []
         self.pocket_result = None
         self.track_paths={}
-        self.show_trails=True
+        self.show_trails=False
+        self.show_ball_boxes=True
+        self.show_pocket_overlays=True
         self.marked_ids=set()
         self.message = "正在打开视频…"
         self.setMinimumSize(320, 240)
@@ -179,6 +240,7 @@ class VideoCanvas(QWidget):
     def set_frame(self, frame, keep_pockets=False):
         if not keep_pockets:
             self.pocket_result = None
+            self.pockets_available.emit(False)
         self.clear_selection()
         self.frame = frame
         self.coordinates = None
@@ -192,12 +254,14 @@ class VideoCanvas(QWidget):
 
     def set_pocket_result(self, result):
         self.pocket_result = result
+        self.pockets_available.emit(result is not None)
         if self.coordinate_mode:
             self.calibrate_coordinates()
         self.update()
 
     def clear_pockets(self):
         self.pocket_result = None
+        self.pockets_available.emit(False)
         self.update()
 
     def clear_selection(self):
@@ -217,26 +281,75 @@ class VideoCanvas(QWidget):
 
     def set_detections(self, detections):
         self.clear_selection()
-        self.detections = detections
+        self.detections = [dict(d) for d in detections]
+        table=next((d for d in self.detections if d['name']=='billiards_table' and d.get('polygon')),None)
+        if table:
+            if self.calibration_polygon is not None:
+                # Only explicit calibration/source changes may replace a validated
+                # table. A player's arm is not evidence that the table moved.
+                polygon=self.table_outline()
+                table['polygon']=polygon
+                points=np.asarray(polygon,float)
+                table['box']=[float(points[:,0].min()),float(points[:,1].min()),float(points[:,0].max()),float(points[:,1].max())]
+            else:
+                self.recognition_polygon=table['polygon']
+                if self.pocket_result:self.pocket_result['table']['scope_polygon']=table['polygon']
+        if self.coordinate_mode:self.calibrate_coordinates()
         self.update()
 
     def selected_rect(self):
         return self.box_rect(self.selected_box)
 
+    def is_rotated(self):
+        return self.rotate_portrait and not self.image.isNull() and self.image.height()>self.image.width()
+
+    def resizeEvent(self,event):
+        super().resizeEvent(event)
+        self.fullscreen_button.adjustSize()
+        self.fullscreen_button.move(max(0,self.width()-self.fullscreen_button.width()-12),12)
+        self.fullscreen_button.raise_()
+
+    def display_dimensions(self):
+        return (self.image.height(),self.image.width()) if self.is_rotated() else (self.image.width(),self.image.height())
+
+    def display_point(self,x,y):
+        if self.is_rotated():x,y=self.image.height()-y,x
+        width,height=self.display_dimensions();area=self.video_rect()
+        return QPointF(area.left()+x*area.width()/max(1,width),area.top()+y*area.height()/max(1,height))
+
+    def image_point(self,point):
+        area=self.video_rect()
+        if self.image.isNull() or not area.contains(point) or area.isEmpty():return None
+        width,height=self.display_dimensions()
+        x=(point.x()-area.left())*width/area.width()
+        y=(point.y()-area.top())*height/area.height()
+        return (y,self.image.height()-x) if self.is_rotated() else (x,y)
+
     def box_rect(self, box):
-        if box is None or self.image.isNull():
-            return QRectF()
-        x1, y1, x2, y2 = box
-        target = self.video_rect()
-        sx, sy = target.width() / self.image.width(), target.height() / self.image.height()
-        return QRectF(target.left() + x1 * sx, target.top() + y1 * sy,
-                      (x2 - x1) * sx, (y2 - y1) * sy)
+        if box is None or self.image.isNull():return QRectF()
+        x1,y1,x2,y2=box
+        return self.canvas_polygon([[x1,y1],[x2,y1],[x2,y2],[x1,y2]]).boundingRect()
 
     def video_rect(self):
-        size = self.image.size().scaled(self.size(), Qt.KeepAspectRatio)
-        return QRectF((self.width() - size.width()) / 2,
-                      (self.height() - size.height()) / 2,
-                      size.width(), size.height())
+        from PyQt5.QtCore import QSize
+        width,height=self.display_dimensions()
+        size=QSize(width,height).scaled(self.size(),Qt.KeepAspectRatio)
+        return QRectF((self.width()-size.width())/2,(self.height()-size.height())/2,size.width(),size.height())
+
+    def table_outline(self):
+        if self.calibration_polygon is not None:
+            if self.recognition_polygon is not None:return self.recognition_polygon
+            if self.pocket_result:
+                return self.pocket_result['table'].get('scope_polygon') or self.calibration_polygon
+            return self.calibration_polygon
+        table=next((d for d in self.detections if d['name']=='billiards_table'),None)
+        if table and table.get('polygon'):return table['polygon']
+        if self.selected_polygon is not None and self.selected_label.startswith('台球桌'):return self.selected_polygon
+        if self.recognition_polygon:return self.recognition_polygon
+        if self.pocket_result:
+            table=self.pocket_result['table']
+            return table.get('scope_polygon') or table.get('playable_polygon')
+        return self.calibration_polygon
 
     def calibrate_coordinates(self):
         self.coordinates = None
@@ -245,8 +358,8 @@ class VideoCanvas(QWidget):
             self.coordinate_hovered.emit("尚无画面")
             return
         from src.target_balls import playing_surface
-        polygon = None
-        if self.pocket_result and self.pocket_result['table']['quality'].get('geometry_reliable'):
+        polygon = self.table_outline()
+        if polygon is None and self.pocket_result and self.pocket_result['table']['quality'].get('geometry_reliable'):
             polygon = self.pocket_result['table']['playable_polygon']
         if polygon is None:
             polygon = playing_surface(self.frame)
@@ -263,9 +376,8 @@ class VideoCanvas(QWidget):
             area=self.video_rect();point=event.localPos()
             position=None
             if area.contains(point) and self.coordinates is not None:
-                x=(point.x()-area.left())*self.image.width()/area.width()
-                y=(point.y()-area.top())*self.image.height()/area.height()
-                position=self.coordinates.millimetres(x,y)
+                image_point=self.image_point(point)
+                if image_point is not None:position=self.coordinates.millimetres(*image_point)
             text=(f"鼠标：X = {position[0]:.1f} mm，Y = {position[1]:.1f} mm" if position
                   else "鼠标在台面外" if self.coordinates else "未可靠定位内库，暂不可换算坐标")
             self.coordinate_hovered.emit(text)
@@ -304,9 +416,8 @@ class VideoCanvas(QWidget):
             point = event.localPos()
             target = self.video_rect()
             if target.contains(point):
-                x = (point.x() - target.left()) * self.image.width() / target.width()
-                y = (point.y() - target.top()) * self.image.height() / target.height()
-                self.element_clicked.emit(self.frame.copy(), x, y)
+                image_point=self.image_point(point)
+                if image_point is not None:self.element_clicked.emit(self.frame.copy(), *image_point)
         super().mousePressEvent(event)
 
     def paintEvent(self, event):
@@ -317,7 +428,13 @@ class VideoCanvas(QWidget):
             painter.drawText(self.rect().adjusted(24, 24, -24, -24),
                              Qt.AlignCenter | Qt.TextWordWrap, self.message)
         else:
-            painter.drawImage(self.video_rect(), self.image)
+            area=self.video_rect()
+            if self.is_rotated():
+                painter.save()
+                painter.translate(area.right(),area.top());painter.rotate(90)
+                painter.drawImage(QRectF(0,0,area.height(),area.width()),self.image)
+                painter.restore()
+            else:painter.drawImage(area,self.image)
             self.draw_track_paths(painter)
             occupied = []
             # Draw large table boxes first so small ball boxes stay visible.
@@ -327,13 +444,22 @@ class VideoCanvas(QWidget):
             for item in items:
                 if self.selected_box is not None and item["box"]==self.selected_box:
                     continue
+                if item['name']=='billiards_table' or not self.show_ball_boxes:continue
                 self.draw_detection(painter, item["box"], chinese_label(item["name"])+(f" B{item['ball_id']}" if item.get("ball_id") else "")+(" · 已选" if item.get("track_id") in self.marked_ids else ""),
                                     ("#FF9F43" if item.get("track_id") in self.marked_ids else colors.get(item["name"], "#FFEB00")), 14, occupied, item.get("polygon"))
-            if self.selected_box is not None:
+            if self.show_ball_boxes and self.selected_box is not None and self.selected_polygon is None:
                 self.draw_detection(painter, self.selected_box, self.selected_label,
                                     "#FFEB00", 20, occupied, self.selected_polygon)
             self.draw_pockets(painter)
             self.draw_coordinates(painter)
+            if self.exam_circles and self.calibration_polygon is not None:
+                from src.exam_editor import draw_marks
+                draw_marks(painter,TableCoordinates(self.table_outline(),self.dimensions),self.exam_circles,self.display_point)
+            scope=self.table_outline()
+            if scope and (self.show_pocket_overlays or self.pocket_result is None):
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(QColor('#40C4FF'),2))
+                painter.drawPolygon(self.canvas_polygon(scope))
 
     def draw_track_paths(self,painter):
         if not self.show_trails:return
@@ -350,29 +476,40 @@ class VideoCanvas(QWidget):
 
     def draw_pockets(self, painter):
         result = self.pocket_result
-        if not result:
+        if not result or not self.show_pocket_overlays:
             return
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setBrush(Qt.NoBrush)
         table = result['table']
-        scope=table.get('scope_polygon') or table['playable_polygon']
-        if scope:
-            painter.setPen(QPen(QColor('#40C4FF'), 2))
-            painter.drawPolygon(self.canvas_polygon(scope))
-            for edge in (table['boundary_lines'] if self.coordinate_mode else []):
-                painter.setPen(QPen(QColor('#40C4FF'), 1, Qt.DashLine))
-                points = self.canvas_polygon([edge['start'], edge['end']])
-                painter.drawLine(points[0], points[1])
         names = {'TOP_LEFT':'左上袋','TOP_MIDDLE':'上中袋','TOP_RIGHT':'右上袋',
                  'BOTTOM_LEFT':'左下袋','BOTTOM_MIDDLE':'下中袋','BOTTOM_RIGHT':'右下袋'}
-        states = {'observed':('已验证','#52E377'), 'estimated':('估算','#FFDB4D'), 'missing':('未定位','#FF7070')}
+        # Pocket IDs describe the table plane; labels should describe the screen.
+        located=[]
+        for p in result['pockets']:
+            raw=p['center'] or p['candidate_center']
+            point=self.display_point(raw['x'],raw['y']) if raw else None
+            located.append((p,{'x':point.x(),'y':point.y()} if point is not None else None))
+        if len(located)==6 and all(point is not None for _,point in located):
+            corners=np.array([[p.x(),p.y()] for p in self.canvas_polygon(table['playable_polygon'])])
+            if np.ptp(corners[:,1])>np.ptp(corners[:,0]):
+                ordered=sorted(located,key=lambda item:item[1]['x'])
+                groups=[sorted(ordered[:3],key=lambda item:item[1]['y']),
+                        sorted(ordered[3:],key=lambda item:item[1]['y'])]
+                labels=[['左上袋','左中袋','左下袋'],['右上袋','右中袋','右下袋']]
+            else:
+                ordered=sorted(located,key=lambda item:item[1]['y'])
+                groups=[sorted(ordered[:3],key=lambda item:item[1]['x']),
+                        sorted(ordered[3:],key=lambda item:item[1]['x'])]
+                labels=[['左上袋','上中袋','右上袋'],['左下袋','下中袋','右下袋']]
+            names={p['id']:label for group,words in zip(groups,labels) for (p,_),label in zip(group,words)}
+        states = {'observed':('已验证','#52E377'), 'estimated':('估算','#FFDB4D'), 'missing':('未定位','#FF7070'), 'manual':('人工确认','#00E5FF')}
         occupied = []
         font = QFont(self.font());font.setPixelSize(13);font.setBold(True);painter.setFont(font)
         area = self.video_rect()
         for pocket in result['pockets']:
             state, color = states[pocket['status']]
             highlight = QColor(color)
-            painter.setPen(QPen(highlight, 2, Qt.SolidLine if pocket['status']=='observed' else Qt.DashLine))
+            painter.setPen(QPen(highlight, 2, Qt.SolidLine if pocket['status'] in ('observed','manual') else Qt.DashLine))
             if pocket['entry_polygon']:
                 painter.drawPolygon(self.canvas_polygon(pocket['entry_polygon']))
             marker = pocket['center'] or pocket['candidate_center']
@@ -395,10 +532,7 @@ class VideoCanvas(QWidget):
             painter.fillRect(label,Qt.black);painter.setPen(highlight);painter.drawText(label,Qt.AlignCenter,text)
 
     def canvas_polygon(self, polygon):
-        target = self.video_rect()
-        return QPolygonF([QPointF(target.left() + x * target.width() / self.image.width(),
-                                 target.top() + y * target.height() / self.image.height())
-                          for x, y in polygon])
+        return QPolygonF([self.display_point(x,y) for x,y in polygon])
 
     def draw_detection(self, painter, box, text, color, font_size, occupied, polygon=None):
         shape = self.canvas_polygon(polygon) if polygon else None
@@ -446,12 +580,25 @@ class MainWindow(QMainWindow):
     identify_all_requested = pyqtSignal(object, int)
     live_requested = pyqtSignal(object, int)
     load_requested = pyqtSignal()
+    calibration_requested = pyqtSignal(object, int, object)
     pocket_requested = pyqtSignal(object, int, object)
 
     def __init__(self, video_path=DEFAULT_VIDEO, image_dir=DEFAULT_IMAGES, start_with_images=False):
         super().__init__()
         self.setWindowTitle("台球视觉识别系统")
         self.resize(1200, 800)
+        from src.calibration_presets import CalibrationPresets
+        self.calibration_presets=CalibrationPresets(ROOT/"config"/"venues")
+        self.active_calibration_preset=self.calibration_presets.data["default"]
+        self.camera_alignment=None
+        self.camera_geometry=None
+        self.camera_anchor=np.eye(3)
+        self.camera_matrix=np.eye(3)
+        self.exam_dialog=None
+        self.exam_pending=None
+        self.exam_save_timer=QTimer(self)
+        self.exam_save_timer.setSingleShot(True)
+        self.exam_save_timer.timeout.connect(self.flush_exam_marks)
         self.canvas = VideoCanvas()
         content = QWidget()
         layout = QVBoxLayout(content)
@@ -477,32 +624,73 @@ class MainWindow(QMainWindow):
         gallery_layout.addWidget(self.image_info, 1)
         gallery_layout.addWidget(self.next_button)
         layout.addWidget(gallery)
+        profile_bar=QWidget();profile_layout=QHBoxLayout(profile_bar)
+        profile_layout.setContentsMargins(16,4,16,4)
+        profile_layout.addWidget(QLabel("球房／球桌配置："))
+        self.calibration_preset_combo=QComboBox();self.calibration_preset_combo.setMinimumSize(220,44)
+        self.calibration_preset_combo.setAccessibleName("选择球房和球桌的已保存校准")
+        self.calibration_preset_combo.setToolTip("选择同一球桌与固定镜头的配置；球桌范围、袋口和尺寸直接恢复")
+        self.add_calibration_preset_button=QPushButton("另存为配置")
+        self.add_calibration_preset_button.setToolTip("将当前校准另存为球房／球桌配置；每个新球桌首次校准一次，之后直接选择使用")
+        self.default_calibration_preset_button=QPushButton("设为默认")
+        for button in (self.add_calibration_preset_button,self.default_calibration_preset_button):button.setMinimumSize(100,44)
+        profile_layout.addWidget(self.calibration_preset_combo)
+        profile_layout.addWidget(self.add_calibration_preset_button)
+        profile_layout.addWidget(self.default_calibration_preset_button)
+        self.exam_button=QPushButton("考题")
+        self.exam_button.setMinimumSize(100,44)
+        self.exam_button.clicked.connect(self.open_exam)
+        profile_layout.addWidget(self.exam_button)
+        self.calibration_state_label=QLabel("校准：未保存")
+        self.calibration_state_label.setWordWrap(True)
+        profile_layout.addWidget(self.calibration_state_label,1)
+        profile_layout.addStretch()
+        self.refresh_calibration_presets()
+        self.calibration_preset_combo.currentIndexChanged.connect(self.select_calibration_preset)
+        self.add_calibration_preset_button.clicked.connect(self.add_calibration_preset)
+        self.default_calibration_preset_button.clicked.connect(self.set_default_calibration_preset)
+        layout.addWidget(profile_bar)
         controls = QWidget()
         buttons = QHBoxLayout(controls)
         buttons.setContentsMargins(16, 8, 16, 8)
         buttons.setSpacing(12)
         self.play_button = QPushButton("播放")
-        self.pause_button = QPushButton("暂停")
         self.yolo_button = QPushButton("YOLO：关闭")
         self.yolo_button.setCheckable(True)
         self.yolo_button.setMinimumSize(150, 44)
         self.yolo_button.setToolTip("开启后点选球，再播放只跟踪该球；点击识别全部才识别所有目标")
         buttons.addStretch()
-        for button in (self.play_button, self.pause_button):
+        for button in (self.play_button,):
             button.setMinimumSize(100, 44)
             button.setEnabled(False)
             buttons.addWidget(button)
         buttons.addWidget(self.yolo_button)
-        self.identify_all_button = QPushButton("识别全部")
+        self.identify_all_button = QPushButton("全部识别")
         self.identify_all_button.setMinimumSize(120, 44)
         self.identify_all_button.setEnabled(False)
-        self.identify_all_button.setToolTip("播放时开启连续识别；图片或暂停画面识别一次。黑白球分别标名，其余统一标为台球")
+        self.identify_all_button.setToolTip("点击识别全部目标，再次点击取消；播放时持续更新")
         buttons.addWidget(self.identify_all_button)
         self.pocket_button = QPushButton("自动检测袋口")
         self.pocket_button.setMinimumSize(150, 44)
         self.pocket_button.setEnabled(False)
-        self.pocket_button.setToolTip("独立检测当前画面的球桌与六袋口，自动保存 JSON 和调试图；可重复检测")
+        self.pocket_button.setToolTip("重新读取当前画面，自动校准球桌范围与六个袋口；不识别球体，可重复检测")
         buttons.addWidget(self.pocket_button)
+        self.pocket_visibility_button=QPushButton("隐藏袋口识别")
+        self.pocket_visibility_button.setCheckable(True)
+        self.pocket_visibility_button.setMinimumSize(130,44)
+        self.pocket_visibility_button.hide()
+        self.pocket_visibility_button.toggled.connect(self.toggle_pocket_visibility)
+        self.canvas.pockets_available.connect(self.pocket_visibility_button.setVisible)
+        buttons.addWidget(self.pocket_visibility_button)
+        self.pot_button=QPushButton("进球检测")
+        self.pot_button.setCheckable(True);self.pot_button.setMinimumSize(110,44)
+        self.pot_button.setToolTip("自动观察黑白球接近袋口、消失及静止后的复核；证据不足会提示人工复核")
+        self.pot_button.toggled.connect(self.toggle_pot_detection)
+        buttons.addWidget(self.pot_button)
+        self.pot_count_label=QLabel("（0）")
+        self.pot_count_label.setToolTip("当前视频已确认的所有球入袋总数（含白球）；疑似与待复核不计入")
+        buttons.addWidget(self.pot_count_label)
+        self.pot_counts={};self.pot_count_epoch=0;self.pot_reset_count_on_play=False
         buttons.addStretch()
         layout.addWidget(controls)
         coordinate_bar=QWidget()
@@ -510,23 +698,35 @@ class MainWindow(QMainWindow):
         coordinate_layout.setContentsMargins(16,0,16,8)
         self.coordinate_button=QPushButton("坐标模式")
         self.coordinate_button.setCheckable(True);self.coordinate_button.setMinimumSize(110,44)
-        self.coordinate_button.setToolTip("以内库四角建立毫米坐标；开启时暂停视频，移动鼠标查看坐标，点击球查看球心坐标")
+        self.coordinate_button.setToolTip("以当前识别台面四角建立毫米坐标；开启时暂停视频，移动鼠标查看坐标，点击球查看球心坐标")
         self.dimensions_button=QPushButton("球桌尺寸")
         self.dimensions_button.setMinimumSize(100,44)
-        self.trails_button=QPushButton("轨迹：开启")
-        self.trails_button.setCheckable(True);self.trails_button.setChecked(True);self.trails_button.setMinimumSize(100,44)
-        self.trails_button.toggled.connect(self.toggle_trails)
-        self.trails_button.setToolTip("显示球体固定 ID 和运动轨迹；位置记录自动保存到 data/tracking/")
+        self.trails_button=QComboBox()
+        self.trails_button.addItems(["全部运动球轨迹","白球运动轨迹","其他球运动轨迹","当前所选球运动轨迹","关闭轨迹"])
+        self.trails_button.setCurrentIndex(4)
+        self.trails_button.currentIndexChanged.connect(self.toggle_trails)
+        self.trails_button.setToolTip("前三种模式播放时自动跟踪，无需选球；所选球模式需先点选目标；关闭轨迹隐藏所有轨迹")
         coordinate_layout.addWidget(self.trails_button)
         self.coordinate_readout=QLabel("坐标模式未开启")
         self.ball_coordinate_readout=QLabel("球心：未选择")
         self.ball_coordinate_readout.setTextInteractionFlags(Qt.TextSelectableByMouse)
         coordinate_layout.addWidget(self.coordinate_button)
         coordinate_layout.addWidget(self.dimensions_button)
+        self.manual_calibration_button=QPushButton("手动校准")
+        self.manual_calibration_button.setMinimumSize(100,44)
+        self.manual_calibration_button.setToolTip("点选台呢内沿四角及六袋口，按当前来源保存，更新球桌与袋口")
+        self.manual_calibration_button.clicked.connect(self.edit_calibration)
+        coordinate_layout.addWidget(self.manual_calibration_button)
         coordinate_layout.addWidget(self.coordinate_readout,1)
         coordinate_layout.addWidget(self.ball_coordinate_readout)
         layout.addWidget(coordinate_bar)
-        self.dimension_path=ROOT/'config'/'table_dimensions.json'
+        self.pot_readout=QLabel("进球检测未开启")
+        self.pot_readout.setWordWrap(True);self.pot_readout.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.pot_readout.setContentsMargins(16,0,16,8)
+        layout.addWidget(self.pot_readout)
+        self.pot_adapter=None;self.pot_recording=None;self.pot_last_snapshot=None
+        self.pot_observer=None
+        self.dimension_path=(self.calibration_presets.path(self.active_calibration_preset).with_suffix('.dimensions.json') if self.active_calibration_preset else ROOT/'config'/'table_dimensions.json')
         try:
             self.canvas.dimensions=TableDimensions(**json.loads(self.dimension_path.read_text())) if self.dimension_path.exists() else TableDimensions()
         except (ValueError,TypeError,OSError):
@@ -536,6 +736,11 @@ class MainWindow(QMainWindow):
         self.dimensions_button.clicked.connect(self.configure_dimensions)
         self.canvas.coordinate_hovered.connect(self.coordinate_readout.setText)
         self.setCentralWidget(content)
+        self.video_fullscreen=False
+        self.fullscreen_controls=[gallery,profile_bar,controls,coordinate_bar,self.pot_readout,self.statusBar()]
+        self.canvas.fullscreen_requested.connect(self.toggle_video_fullscreen)
+        self.fullscreen_escape=QShortcut(QKeySequence(Qt.Key_Escape),self)
+        self.fullscreen_escape.activated.connect(lambda:self.toggle_video_fullscreen() if self.video_fullscreen else None)
         self.capture = None
         self.playback_ready = False
         self.media_mode = "video"
@@ -561,6 +766,7 @@ class MainWindow(QMainWindow):
         self.selected_targets={}
         self.selection_counter=100000
         self.pending_selection=None
+        self.selection_busy=False;self.resume_after_selection=False
         self.detection_mode="idle"
         self.single_table_polygon=None
         self.live_last_result_time=None
@@ -569,18 +775,23 @@ class MainWindow(QMainWindow):
         self.pocket_thread = None
         self.pocket_worker = None
         self.last_pocket_result = None
+        self.calibration_busy=False
+        self.calibration_thread=None
+        self.calibration_worker=None
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.next_frame)
-        self.play_button.clicked.connect(self.play_video)
-        self.pause_button.clicked.connect(self.pause_video)
+        self.play_button.clicked.connect(self.toggle_playback)
         self.yolo_button.toggled.connect(self.toggle_yolo)
         self.identify_all_button.clicked.connect(self.identify_all_elements)
         self.pocket_button.clicked.connect(self.detect_pockets)
         self.canvas.element_clicked.connect(self.identify_element)
         self.video_path = Path(video_path).expanduser().resolve()
+        self.video_paths=sorted((p.resolve() for p in self.video_path.parent.iterdir() if p.is_file() and p.suffix.lower() in {'.mp4','.mov','.mkv','.avi','.m4v'}),key=lambda p:p.name.casefold()) if self.video_path.parent.is_dir() else []
+        if self.video_path not in self.video_paths:self.video_paths.append(self.video_path)
+        self.video_index=self.video_paths.index(self.video_path)
         self.source_combo.currentIndexChanged.connect(self.switch_source)
-        self.previous_button.clicked.connect(lambda: self.show_image(self.image_index - 1))
-        self.next_button.clicked.connect(lambda: self.show_image(self.image_index + 1))
+        self.previous_button.clicked.connect(lambda: self.navigate_media(-1))
+        self.next_button.clicked.connect(lambda: self.navigate_media(1))
         self.previous_shortcut = QShortcut(QKeySequence(Qt.Key_Left), self)
         self.next_shortcut = QShortcut(QKeySequence(Qt.Key_Right), self)
         self.previous_shortcut.activated.connect(self.previous_button.click)
@@ -589,19 +800,152 @@ class MainWindow(QMainWindow):
             self.source_combo.setCurrentIndex(1)
         else:
             self.switch_source(0)
+        if self.calibration_presets.error:
+            self.statusBar().showMessage("球桌配置列表无法读取，原文件已保留："+self.calibration_presets.error)
 
-    def toggle_trails(self,enabled):
-        self.canvas.show_trails=enabled
-        self.trails_button.setText("轨迹：开启" if enabled else "轨迹：关闭")
+    def toggle_video_fullscreen(self):
+        self.video_fullscreen=not self.video_fullscreen
+        self.canvas.rotate_portrait=self.video_fullscreen
+        self.canvas.fullscreen_button.setText("恢复竖屏" if self.video_fullscreen else "旋转放大")
+        self.canvas.fullscreen_button.adjustSize()
+        self.canvas.fullscreen_button.move(max(0,self.canvas.width()-self.canvas.fullscreen_button.width()-12),12)
         self.canvas.update()
+
+    def update_pot_count(self,results=(),clear=False):
+        if clear:self.pot_counts.clear()
+        for result in results:
+            for event in result['events']:
+                key=(self.pot_count_epoch,result['shot_id'],event['ball'])
+                self.pot_counts[key]=event['event']=='POTTED'
+        self.pot_count_label.setText(f"（{sum(self.pot_counts.values())}）")
+
+    def reset_pot_session(self,reason):
+        if self.pot_adapter is not None and not self.pot_adapter.engine.completed and self.pot_adapter.engine.timestamp is not None:
+            results=self.pot_adapter.engine.finish(force_unknown=reason)
+            self.update_pot_count(results)
+            if self.pot_recording:self.pot_recording.write(self.pot_adapter.engine.snapshot(),results)
+        if self.pot_recording:self.pot_recording.close()
+        self.pot_observer=None
+        self.pot_count_epoch+=1
+        self.pot_adapter=None;self.pot_recording=None;self.pot_last_snapshot=None
+        self.pot_readout.setText("进球检测："+reason if self.pot_button.isChecked() else "进球检测未开启")
+        self.pot_resume_after_calibration=False
+
+    def toggle_pot_detection(self,enabled):
+        self.yolo_generation+=1
+        self.reset_pot_session("等待当前视频画面")
+        self.pot_button.setText("关闭进球检测" if enabled else "进球检测")
+        if not enabled:return
+        if self.media_mode!="video":
+            self.pot_readout.setText("进球检测需要完整视频，请切换到视频后播放")
+            return
+        self.pocket_visibility_button.setChecked(False)
+        if self.canvas.pocket_result is None:
+            self.pot_readout.setText("进球检测：正在定位球桌与袋口…")
+            resume=self.timer.isActive()
+            self.detect_pockets()
+            self.pot_resume_after_calibration=resume
+            return
+        self.prepare_pot_detection()
+
+    def prepare_pot_detection(self):
+        if not self.pot_button.isChecked() or self.media_mode!="video":return
+        if self.pot_adapter is None:
+            if self.canvas.pocket_result is None:
+                self.pot_readout.setText("进球检测：请先自动检测袋口，再播放完整击球视频")
+                return
+            try:
+                from src.vision.pocket_event.adapter import PocketEventAdapter
+                from src.vision.pocket_event.recording import EventRecording
+                self.pot_adapter=PocketEventAdapter(self.canvas.pocket_result,self.canvas.dimensions)
+                from src.vision.pocket_event.pixel_observer import PixelBallObserver
+                self.pot_observer=PixelBallObserver(self.canvas.pocket_result['table']['playable_polygon'])
+                self.pot_recording=EventRecording(ROOT/'data'/'pocket_events',self.video_path)
+            except (ValueError,KeyError,cv2.error) as exc:
+                self.pot_readout.setText(f"进球检测暂不可用：{exc}");return
+            self.pot_readout.setText("黑球：等待完整轨迹；白球：等待完整轨迹 · 播放视频开始观察")
+        if (self.automatic_trails() or self.detection_mode!="idle") and not self.yolo_button.isChecked():self.yolo_button.setChecked(True)
+        self.maybe_submit_live()
+
+    def observe_current_pot_frame(self,frame):
+        if not self.pot_button.isChecked():return
+        if self.pot_observer is None or self.pot_adapter is None:self.prepare_pot_detection()
+        if self.pot_observer is None or self.pot_adapter is None:return
+        fps=self.capture.get(cv2.CAP_PROP_FPS)
+        index=max(0,self.capture.get(cv2.CAP_PROP_POS_FRAMES)-1)
+        if fps>0:
+            self.observe_pot_events(index/fps,self.pot_observer.observe(frame),frame)
+
+    def observe_pot_events(self,timestamp,detections,frame):
+        if self.pot_adapter is None:
+            self.prepare_pot_detection()
+            if self.pot_adapter is None:return
+        try:
+            results=self.pot_adapter.update(timestamp,detections,frame)
+            self.update_pot_count(results)
+            snapshot=self.pot_adapter.engine.snapshot()
+            labels={'TRACKING':'桌面可见','APPROACHING_POCKET':'接近袋口','POT_CANDIDATE':'疑似进袋，等待复核',
+                    'POTTED':'已进袋','NOT_POTTED':'未进袋','UNKNOWN':'无法确认，需要人工复核'}
+            names={'TOP_LEFT':'左上袋','TOP_MIDDLE':'上中袋','TOP_RIGHT':'右上袋',
+                   'BOTTOM_LEFT':'左下袋','BOTTOM_MIDDLE':'下中袋','BOTTOM_RIGHT':'右下袋'}
+            parts=[]
+            for ball,title in (('black_ball','黑球'),('white_ball','白球')):
+                state=snapshot['balls'][ball]
+                suffix=(' · '+names.get(state['candidate_pocket'],state['candidate_pocket'])) if state['candidate_pocket'] else ''
+                parts.append(title+'：'+labels[state['state']]+suffix)
+            signature=tuple((ball,state['state'],state['candidate_pocket']) for ball,state in snapshot['balls'].items())
+            targets=[state for ball,state in snapshot['balls'].items() if ball.startswith('billiard_ball:')]
+            if targets:
+                pending=sum(state['state'] in ('UNKNOWN','POT_CANDIDATE') and state['candidate_pocket'] is not None for state in targets)
+                parts.append(f"进球候选：待复核 {pending} 项")
+            if signature!=self.pot_last_snapshot or results:
+                self.pot_recording.write(snapshot,results,frame)
+                self.pot_last_snapshot=signature
+            self.pot_readout.setText(' | '.join(parts)+f" · 已确认 {sum(self.pot_counts.values())} 球 · 实时观察 {timestamp:.2f}s"
+                +(f" · 记录失败：{self.pot_recording.error}" if self.pot_recording.error else ''))
+            self.pot_readout.setToolTip('判定记录：'+str(self.pot_recording.path))
+        except (ValueError,KeyError,cv2.error) as exc:
+            self.pot_readout.setText(f"进球判定证据异常，需人工复核：{exc}")
+
+    def automatic_trails(self):
+        return self.trails_button.currentIndex()<3
+
+    def toggle_pocket_visibility(self, hidden):
+        self.canvas.show_pocket_overlays=not hidden
+        self.pocket_visibility_button.setText("显示袋口识别" if hidden else "隐藏袋口识别")
+        self.canvas.update()
+
+    def toggle_trails(self, mode):
+        self.canvas.show_trails=mode!=4
+        self.yolo_generation+=1  # Results from a former selected-only request are obsolete.
+        self.pending_selection=None
+        if mode<3:
+            self.selected_targets.clear();self.live_selected_id=None
+            self.canvas.selected_box=None;self.canvas.selected_polygon=None;self.canvas.marked_ids.clear()
+            if self.detection_mode=="single":self.detection_mode="idle"
+            self.ball_coordinate_readout.setText("球心：未选择")
+            if not self.yolo_button.isChecked():self.yolo_button.setChecked(True)
+            self.maybe_submit_live()
+        self.canvas.show_ball_boxes=self.detection_mode=="all" or self.detection_mode=="single" and mode>=3
+        if mode==3:
+            if self.selected_targets:
+                if not self.yolo_button.isChecked():self.yolo_button.setChecked(True)
+                self.maybe_submit_live()
+            else:self.statusBar().showMessage("所选球轨迹：请先点击视频中的球，再播放")
+        self.sync_tracks();self.canvas.update();self.update_all_button()
 
     def sync_tracks(self):
         identities=self.live_tracking.identities
-        visible=set(self.selected_targets) if self.detection_mode=="single" else set(identities.states)
-        self.canvas.track_paths={key:list(state['path']) for key,state in identities.states.items() if key in visible}
-        if self.media_mode!="video" or self.detection_mode=="idle" or self.capture is None or not self.playback_ready:return
+        visible=set(self.selected_targets) if self.detection_mode=="single" and not self.automatic_trails() else set(identities.states)
+        mode=self.trails_button.currentIndex()
+        selected=set(self.selected_targets)
+        if self.live_selected_id is not None:selected.add(self.live_selected_id)
+        self.canvas.track_paths={key:list(state['path']) for key,state in identities.states.items()
+            if key in visible and (mode==0 or mode==1 and state['name']=='white_ball'
+                                   or mode==2 and state['name']!='white_ball' or mode==3 and key in selected)}
+        if self.media_mode!="video" or (self.detection_mode=="idle" and not self.automatic_trails()) or self.capture is None or not self.playback_ready:return
         table=next((d for d in self.live_tracking.detections if d['name']=='billiards_table'),None)
-        polygon=table.get('playable_polygon') if table else self.single_table_polygon
+        polygon=self.canvas.table_outline()
         coordinates=None
         if polygon:
             try:coordinates=TableCoordinates(polygon,self.canvas.dimensions)
@@ -622,6 +966,7 @@ class MainWindow(QMainWindow):
         self.dimensions_button.setToolTip("内库之间的比赛区域尺寸；X 为上边方向，Y 为左边向下。点击修改并保存。")
 
     def configure_dimensions(self):
+        self.close_exam()
         dialog=QDialog(self);dialog.setWindowTitle("球桌比赛区域尺寸")
         form=QFormLayout(dialog)
         info=QLabel("填写四条内库之间的比赛区域尺寸（mm）。\n原点为左上内库交点，X 向右，Y 向下。\n默认 3569 × 1778 mm 为参考配置，非实测尺寸。")
@@ -643,10 +988,442 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"尺寸保存失败：{exc}")
             return
         self.canvas.dimensions=dimensions;self.canvas.coordinates=None;self.canvas.coordinate_ball=None
+        self.reset_pot_session("球桌尺寸已改变")
         self.refresh_dimension_label()
         self.ball_coordinate_readout.setText("球心：未选择")
         if self.canvas.coordinate_mode:self.canvas.calibrate_coordinates()
         self.canvas.update()
+
+    def open_exam(self):
+        if self.canvas.frame is None or self.canvas.calibration_polygon is None:
+            self.statusBar().showMessage("请先自动或手动校准球桌，再打开考题")
+            return
+        if self.exam_dialog is not None:
+            self.exam_dialog.show();self.exam_dialog.raise_();self.exam_dialog.activateWindow();return
+        from src.exam_editor import ExamDialog
+        self.exam_dialog=ExamDialog(self.canvas.frame.copy(),self.canvas.table_outline(),self.canvas.dimensions,self.canvas.exam_circles,self)
+        self.exam_dialog.changed.connect(self.change_exam_marks)
+        self.exam_dialog.finished.connect(self.finish_exam)
+        self.exam_dialog.show()
+
+    def finish_exam(self,*args):
+        dialog=self.exam_dialog;self.exam_dialog=None
+        if dialog is not None:dialog.deleteLater()
+        self.flush_exam_marks()
+
+    def change_exam_marks(self,marks):
+        self.canvas.exam_circles=deepcopy(marks);self.canvas.update()
+        self.exam_pending=(self.calibration_profile_path().with_suffix('.exam.json'),deepcopy(marks))
+        self.exam_save_timer.start(250)
+
+    def flush_exam_marks(self):
+        self.exam_save_timer.stop()
+        if self.exam_pending is None:return
+        path,marks=self.exam_pending
+        try:
+            from src.calibration_state import write_json
+            write_json(path,{'version':1,'circles':marks})
+            self.exam_pending=None
+        except OSError as exc:self.statusBar().showMessage(f"考题标注保存失败：{exc}")
+
+    def load_exam_marks(self):
+        self.canvas.exam_circles=[]
+        path=self.calibration_profile_path().with_suffix('.exam.json')
+        try:
+            if path.exists():
+                from src.exam_editor import validate_marks
+                data=json.loads(path.read_text())
+                if data.get('version')!=1:raise ValueError('不支持的考题版本')
+                self.canvas.exam_circles=validate_marks(data['circles'])
+        except (OSError,ValueError,TypeError,KeyError,AttributeError) as exc:
+            self.statusBar().showMessage(f"考题标注读取失败：{exc}")
+        self.canvas.update()
+
+    def close_exam(self):
+        if self.exam_dialog is not None:self.exam_dialog.close()
+        self.flush_exam_marks()
+
+    def calibration_controls(self, busy):
+        self.calibration_busy=busy
+        self.pocket_button.setText("球桌与袋口检测中…" if busy else "自动检测袋口")
+        for widget in (self.play_button,self.previous_button,self.next_button,self.yolo_button,
+                       self.identify_all_button,self.pocket_button,self.coordinate_button,self.dimensions_button,self.source_combo,self.manual_calibration_button,self.pot_button,self.calibration_preset_combo,self.add_calibration_preset_button,self.default_calibration_preset_button,self.exam_button):
+            widget.setEnabled(not busy)
+        self.previous_shortcut.setEnabled(not busy)
+        self.next_shortcut.setEnabled(not busy)
+        self.canvas.selection_enabled=not busy and self.yolo_button.isChecked()
+        if not busy:
+            self.refresh_calibration_presets()
+            self.update_navigation()
+            self.update_all_button()
+
+    def refresh_calibration_presets(self):
+        self.calibration_preset_combo.blockSignals(True)
+        self.calibration_preset_combo.clear()
+        default=self.calibration_presets.data['default']
+        self.calibration_preset_combo.addItem("按视频／图片分别保存"+("（默认）" if default is None else ""),None)
+        for profile in self.calibration_presets.data['profiles']:
+            self.calibration_preset_combo.addItem(profile['name']+("（默认）" if profile['id']==default else ""),profile['id'])
+        self.calibration_preset_combo.setCurrentIndex(max(0,self.calibration_preset_combo.findData(self.active_calibration_preset)))
+        self.calibration_preset_combo.blockSignals(False)
+        self.default_calibration_preset_button.setEnabled(self.active_calibration_preset!=default and not self.calibration_presets.error)
+        self.add_calibration_preset_button.setEnabled(not self.calibration_presets.error)
+
+    def add_calibration_preset(self):
+        name,accepted=QInputDialog.getText(self,"新增球房／球桌配置","配置名称（例如：朝阳俱乐部 · 1号桌）")
+        if not accepted:return
+        try:self.create_calibration_preset(name)
+        except (OSError,ValueError) as exc:self.statusBar().showMessage(f"配置保存失败：{exc}")
+
+    def create_calibration_preset(self,name):
+        previous=deepcopy(self.calibration_presets.data)
+        try:return self._create_calibration_preset(name)
+        except (OSError,ValueError):
+            if self.calibration_presets.data!=previous:
+                self.calibration_presets.data=previous
+                self.calibration_presets.save()
+            raise
+
+    def _create_calibration_preset(self,name):
+        self.close_exam()
+        from src.calibration_state import save_automatic,write_json
+        old_path=self.calibration_profile_path()
+        manual=json.loads(old_path.read_text()) if old_path.exists() else None
+        identity=self.calibration_presets.create(name)
+        path=self.calibration_presets.path(identity)
+        if manual is not None:write_json(path,manual)
+        if self.canvas.frame is not None and self.canvas.calibration_polygon is not None and self.canvas.pocket_result is not None:
+            pockets=deepcopy(self.canvas.pocket_result)
+            pockets['table']['scope_polygon']=self.canvas.recognition_polygon or self.canvas.calibration_polygon
+            save_automatic(path.with_suffix('.auto.json'),self.canvas.frame,
+                           {'polygon':self.canvas.calibration_polygon,'pockets':pockets,'calibration_report':{'decision':'saved_preset'}},manual)
+        write_json(path.with_suffix('.exam.json'),{'version':1,'circles':self.canvas.exam_circles})
+        write_json(path.with_suffix('.dimensions.json'),self.canvas.dimensions.__dict__)
+        self.active_calibration_preset=identity
+        self.refresh_calibration_presets()
+        self.select_calibration_preset(self.calibration_preset_combo.currentIndex())
+        return identity
+
+    def set_default_calibration_preset(self):
+        try:self.calibration_presets.set_default(self.active_calibration_preset)
+        except (OSError,ValueError) as exc:
+            self.statusBar().showMessage(f"默认配置保存失败：{exc}");return
+        self.refresh_calibration_presets()
+        self.statusBar().showMessage("已设为默认，下次打开直接使用该配置；后续校准会自动保存")
+
+    def select_calibration_preset(self,index):
+        if self.calibration_busy:return
+        self.pause_video()
+        self.active_calibration_preset=self.calibration_preset_combo.itemData(index)
+        self.invalidate_results()
+        self.dimension_path=(self.calibration_presets.path(self.active_calibration_preset).with_suffix('.dimensions.json') if self.active_calibration_preset else ROOT/'config'/'table_dimensions.json')
+        try:self.canvas.dimensions=TableDimensions(**json.loads(self.dimension_path.read_text())) if self.dimension_path.exists() else TableDimensions()
+        except (OSError,ValueError,TypeError):self.canvas.dimensions=TableDimensions()
+        self.refresh_dimension_label()
+        restored=self.restore_saved_calibration()
+        self.refresh_calibration_presets()
+        name=self.calibration_preset_combo.currentText()
+        self.statusBar().showMessage(f"已加载 {name}，点击播放即可使用" if restored else f"{name} 尚无适用校准，请先自动或手动校准一次")
+
+    def calibration_profile_path(self):
+        if self.active_calibration_preset:return self.calibration_presets.path(self.active_calibration_preset)
+        source=(self.image_paths[self.image_index] if self.media_mode=='images' else self.video_path)
+        key=hashlib.sha256(str(source.resolve()).encode('utf-8')).hexdigest()
+        return ROOT/'config'/'calibration'/f'{key}.json'
+
+    def start_camera_alignment(self,reference=None,legacy=False):
+        self.camera_alignment=None;self.camera_geometry=None
+        self.camera_anchor=np.eye(3);self.camera_matrix=np.eye(3)
+        if self.media_mode!='video' or self.canvas.calibration_polygon is None:return
+        from src.camera_alignment import CameraAlignment
+        polygon=deepcopy(self.canvas.calibration_polygon)
+        scope=deepcopy(self.canvas.recognition_polygon or polygon)
+        self.camera_geometry=(polygon,scope,deepcopy(self.canvas.pocket_result))
+        anchor_scope=scope
+        if legacy and reference is None:
+            # Older records have no reference image. Locate the visible cloth
+            # once for this playback session, keeping the disk baseline intact.
+            from src.cloth_region import cloth_region
+            region=cloth_region(self.canvas.frame,polygon)
+            if region and region['color_fill']>.9 and region['connected_color_coverage']>.95:
+                candidate=np.asarray(region['polygon'],float)
+                prior=np.asarray(scope,float)
+                shift=np.max(np.linalg.norm(candidate-prior,axis=1))
+                ratio=abs(cv2.contourArea(candidate.astype(np.float32))/cv2.contourArea(prior.astype(np.float32)))
+                if shift<min(self.canvas.frame.shape[:2])*.12 and .75<ratio<1.3:
+                    self.camera_anchor=cv2.getPerspectiveTransform(np.float32(scope),np.float32(candidate))
+                    anchor_scope=candidate.tolist()
+        try:
+            self.camera_alignment=CameraAlignment(self.canvas.frame,anchor_scope,reference)
+            self.update_camera_alignment(self.canvas.frame,force=True)
+        except (ValueError,cv2.error) as exc:
+            self.camera_alignment=None
+            self.statusBar().showMessage(f'画面对齐暂不可用，保留已保存基准：{exc}')
+
+    def update_camera_alignment(self,frame,force=False):
+        if self.camera_alignment is None or self.camera_geometry is None:return
+        from src.camera_alignment import transform_geometry
+        result=self.camera_alignment.update(frame,force)
+        note='对齐证据不足，暂保留位置' if self.camera_alignment.lost else '已随画面对齐'
+        self.calibration_state_label.setText(getattr(self,'calibration_state_text','固定基准')+' · '+note)
+        matrix=self.camera_alignment.matrix@self.camera_anchor
+        if result is None and not force:return
+        if np.allclose(matrix,self.camera_matrix,atol=1e-5):return
+        delta=matrix@np.linalg.inv(self.camera_matrix)
+        polygon,scope,pockets=transform_geometry(*self.camera_geometry,matrix)
+        self.camera_matrix=matrix
+        self.canvas.calibration_polygon=polygon;self.canvas.recognition_polygon=scope
+        self.single_table_polygon=polygon
+        self.canvas.pocket_result=pockets;self.last_pocket_result=pockets
+        if self.yolo_worker is not None:
+            self.yolo_worker.calibration_polygon=polygon;self.yolo_worker.scope_polygon=scope
+        if self.pot_adapter is not None and pockets is not None:
+            self.pot_adapter.align_geometry(pockets,delta)
+            if self.pot_observer is not None:
+                self.pot_observer.polygon=np.asarray(polygon,np.float32)
+                self.pot_observer.cached_shape=None
+        self.canvas.calibrate_coordinates()
+        self.canvas.update()
+
+    def refresh_calibration_state(self):
+        path=self.calibration_profile_path().with_suffix('.auto.json')
+        try:
+            data=json.loads(path.read_text())
+            when=data.get('saved_at','旧版记录（无时间）')
+            self.calibration_state_text=f'固定基准 · {when}'
+            self.calibration_state_label.setText(self.calibration_state_text)
+            self.calibration_state_label.setToolTip(f'已保存至 {path}\n播放、切换横竖屏、重启均沿用基准；镜头变化时只对齐显示，点击自动检测或手动校准才修改保存值。')
+        except (OSError,ValueError,AttributeError):self.calibration_state_label.setText('校准：尚无已保存记录')
+
+    def restore_saved_calibration(self):
+        """Restore source geometry before any new inference can use the frame."""
+        self._calibration_restore_note=None
+        if self.canvas.frame is None:return False
+        try:
+            path=self.calibration_profile_path()
+            profile=json.loads(path.read_text()) if path.exists() else None
+            from src.calibration_state import load_automatic,profile_digest
+            auto_path=path.with_suffix('.auto.json')
+            automatic=load_automatic(auto_path,self.canvas.frame,profile,verify_scene=False)
+            try:
+                prior=json.loads(auto_path.read_text()) if auto_path.exists() else {}
+                current_auto=prior.get('manual_digest')==profile_digest(profile)
+            except (OSError,ValueError,AttributeError):current_auto=False
+            if automatic is None and current_auto:
+                self._calibration_restore_note='当前画面宽高比或校准版本与保存记录不匹配，未套用旧范围，请检查来源或重新校准'
+                self.statusBar().showMessage(self._calibration_restore_note)
+                return False
+            if automatic is not None:
+                polygon,pockets=automatic
+                # Migrate legacy scopes once, then restore the saved result.
+                if not prior.get('scope_frozen'):
+                    from src.calibration_state import save_automatic
+                    save_automatic(auto_path,self.canvas.frame,{'polygon':polygon,'pockets':pockets,'calibration_report':prior.get('report')},profile)
+            elif profile is not None:
+                from src.manual_calibration import manual_geometry
+                polygon,pockets=manual_geometry(self.canvas.frame,profile)
+                from src.calibration_state import save_automatic
+                save_automatic(auto_path,self.canvas.frame,{'polygon':polygon,'pockets':pockets,'calibration_report':{'decision':'manual_restore'}},profile)
+            else:return False
+        except (OSError,ValueError,TypeError,KeyError,AttributeError,cv2.error) as exc:
+            self.statusBar().showMessage(f"已保存的校准无法恢复，请重新校准：{exc}")
+            return False
+        self.canvas.calibration_polygon=polygon
+        self.canvas.recognition_polygon=pockets['table'].get('scope_polygon') or polygon
+        self.single_table_polygon=polygon
+        if self.yolo_worker is not None:
+            self.yolo_worker.calibration_polygon=polygon
+            self.yolo_worker.scope_polygon=self.canvas.recognition_polygon
+        self.canvas.calibrate_coordinates()
+        self.last_pocket_result=pockets
+        self.canvas.set_pocket_result(pockets)
+        self.load_exam_marks()
+        self.refresh_calibration_state()
+        self.start_camera_alignment(prior.get('alignment_reference'),legacy=True)
+        saved_at=prior.get('saved_at','此前保存（旧版记录无时间）')
+        self._calibration_restore_note=f'已加载固定校准 · 保存于 {saved_at}；保存基准不变，标注随画面移动缩放'
+        self.statusBar().showMessage(self._calibration_restore_note)
+        self.pocket_button.setToolTip(self._calibration_restore_note+'；点击此按钮会主动重新校准')
+        self.canvas.update()
+        return True
+
+    def edit_calibration(self):
+        if self.calibration_busy or self.canvas.frame is None:return
+        self.pause_video()
+        from src.calibration_editor import CalibrationEditor
+        dialog=CalibrationEditor(self.canvas.frame.copy(),self)
+        if dialog.exec_()!=QDialog.Accepted:return
+        path=self.calibration_profile_path()
+        try:
+            path.with_suffix('.auto.json').unlink(missing_ok=True)
+            path.with_suffix('.feedback.json').unlink(missing_ok=True)
+            if dialog.clear_saved:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True,exist_ok=True)
+                temporary=path.with_suffix('.json.tmp')
+                temporary.write_text(json.dumps(dialog.profile(),ensure_ascii=False,indent=2))
+                temporary.replace(path)
+        except OSError as exc:
+            self.statusBar().showMessage(f"手动校准保存失败：{exc}")
+            return
+        self.calibrate_table(collect_sample=not dialog.clear_saved)
+
+    def calibrate_table(self, collect_sample=False):
+        if self.calibration_busy:return
+        if self.canvas.frame is None:
+            self.statusBar().showMessage("尚无画面，无法校准")
+            return
+        self.pause_video()
+        self.pocket_visibility_button.setChecked(False)
+        source=({'kind':'image','path':str(self.image_paths[self.image_index])}
+                if self.media_mode=='images' else
+                {'kind':'video','path':str(self.video_path),
+                 'frame_index':max(0,int(self.capture.get(cv2.CAP_PROP_POS_FRAMES))-1)})
+        try:
+            profile_path=self.calibration_profile_path()
+            if profile_path.exists():source['manual_profile']=json.loads(profile_path.read_text())
+            if collect_sample:source['collect_training_sample']=True
+        except (OSError,ValueError) as exc:
+            self.statusBar().showMessage(f"已保存的校准无法读取，请用手动校准重新保存：{exc}")
+            return
+        frame=self.canvas.frame.copy()
+        self._calibration_backup={key:deepcopy(getattr(self.canvas,key)) for key in
+                                  ('detections','selected_box','selected_polygon','selected_label','pocket_result','calibration_polygon','recognition_polygon','track_paths','marked_ids')}
+        self._calibration_backup['frame']=frame
+        self._calibration_backup['_main']={key:deepcopy(getattr(self,key)) for key in
+                                           ('detection_mode','selected_targets','live_selected_id','live_tracking')}
+        if not collect_sample:
+            previous=self.canvas.calibration_polygon
+            if previous is None:
+                table=next((item for item in list(self.selected_targets.values())+self.canvas.detections
+                            if item['name']=='billiards_table'),None)
+                if table:
+                    previous=table.get('polygon')
+                    if previous is None:
+                        x1,y1,x2,y2=table['box'];previous=[[x1,y1],[x2,y1],[x2,y2],[x1,y2]]
+            try:
+                from src.calibration_state import begin_feedback
+                source['correction_context']=begin_feedback(profile_path.with_suffix('.feedback.json'),frame,previous,source.get('manual_profile'))
+                source['correction_context']['previous_scope']=self.canvas.recognition_polygon or previous
+                source['correction_context']['previous_pockets']=deepcopy(self.canvas.pocket_result)
+            except (OSError,ValueError,cv2.error) as exc:
+                self.statusBar().showMessage(f"无法保存纠错记录：{exc}；当前结果保留")
+                return
+        self.invalidate_results()
+        self.live_inflight=None
+        self.calibration_controls(True)
+        self.statusBar().showMessage("1/4 正在重新读取画面，自动校准球桌与袋口…")
+        if self.calibration_thread is None:
+            self.calibration_thread=QThread(self)
+            self.calibration_worker=CalibrationWorker()
+            self.calibration_worker.moveToThread(self.calibration_thread)
+            self.calibration_thread.finished.connect(self.calibration_worker.deleteLater)
+            self.calibration_requested.connect(self.calibration_worker.run)
+            self.calibration_worker.progress.connect(self.on_calibration_progress)
+            self.calibration_worker.done.connect(self.on_calibration_done)
+            self.calibration_worker.failed.connect(self.on_calibration_failed)
+            self.calibration_thread.start()
+        self.calibration_requested.emit(frame,self.media_generation,source)
+
+    def on_calibration_progress(self,generation,message):
+        if self.calibration_busy and generation==self.media_generation:
+            self.statusBar().showMessage("校准中 · "+message)
+
+    def on_calibration_done(self,generation,frame,result):
+        if generation!=self.media_generation:return
+        report=result.get('calibration_report')
+        persistence_error=None
+        if report:
+            try:
+                from src.calibration_state import save_automatic,write_json
+                path=self.calibration_profile_path()
+                profile=json.loads(path.read_text()) if path.exists() else None
+                if report['decision'] in ('initial','updated') or report.get('scope_corrected'):
+                    save_automatic(path.with_suffix('.auto.json'),frame,result,profile)
+                history_path=path.with_suffix('.feedback.json')
+                history=json.loads(history_path.read_text()) if history_path.exists() else {}
+                history['reports']=(history.get('reports',[])+[report])[-6:]
+                write_json(history_path,history)
+            except (OSError,ValueError,KeyError,TypeError) as exc:persistence_error=str(exc)
+        if not report:
+            try:
+                from src.calibration_state import save_automatic
+                path=self.calibration_profile_path()
+                profile=json.loads(path.read_text()) if path.exists() else None
+                save_automatic(path.with_suffix('.auto.json'),frame,{**result,'calibration_report':{'decision':'manual_applied'}},profile)
+            except (OSError,ValueError,KeyError,TypeError) as exc:persistence_error=str(exc)
+        self._calibration_backup=None
+        self.canvas.set_frame(frame)
+        polygon=result['polygon']
+        self.canvas.calibration_polygon=polygon
+        self.canvas.recognition_polygon=result.get('scope_polygon') or result['pockets']['table'].get('scope_polygon') or polygon
+        self.single_table_polygon=polygon
+        if self.yolo_worker is not None:
+            self.yolo_worker.calibration_polygon=polygon
+            self.yolo_worker.scope_polygon=self.canvas.recognition_polygon
+        self.canvas.calibrate_coordinates()
+        self.last_pocket_result=result['pockets']
+        self.canvas.set_pocket_result(result['pockets'])
+        self.canvas.set_detections(result['detections'])
+        self.start_camera_alignment()
+        self.refresh_calibration_state()
+        if persistence_error:self.calibration_state_label.setText('当前校准未保存，请查看底部错误信息')
+        self.load_exam_marks()
+        self.yolo_busy=False
+        self.calibration_controls(False)
+        self.detection_mode="idle"
+        self.update_all_button()
+        observed=sum(p['status']=='observed' for p in result['pockets']['pockets'])
+        missing=sum(p['status']=='missing' for p in result['pockets']['pockets'])
+        manual=sum(p['status']=='manual' for p in result['pockets']['pockets'])
+        estimated=6-observed-missing-manual
+        conclusion=(f"纠错完成：比较 {report['candidate_count']} 个候选，已修正边界" if report and report['decision']!='unchanged' else
+                    (("未找到更可靠的修正，保留已保存的整套校准；再次校准将扩大搜索" if report['attempt']<4 else
+                      "未找到更可靠的替代结果，已保留整套校准；重复点击不会提高精度") if report else
+                    "人工校准已应用"))
+        if report and report.get('scope_corrected'):
+            conclusion='已恢复连续同色台面范围，黑色和木质外框排除，坐标内沿独立保留'
+        comparison=''
+        if report and report.get('before') and report['decision']=='updated':
+            before,after=report['before'],report['after']
+            comparison=f"（边缘黑色 {before['black_band']:.0%}→{after['black_band']:.0%}，袋口验证 {before['observed']}→{after['observed']}）"
+        self.statusBar().showMessage(
+            conclusion+comparison+f"：台面 1；袋口已验证 {observed}，人工确认 {manual}，估算 {estimated}，未定位 {missing}"
+            + (" · 袋口尚不完整，请减少遮挡后重试" if observed+manual<6 else " · 点击播放继续")
+            + (f" · 结果保存失败，下次打开无法保证恢复：{persistence_error}" if persistence_error else "")
+            + (" · 学习样本已保存（待训练）" if result.get("learning_sample") else "")
+            + (f" · 学习样本保存失败：{result['learning_sample_error']}" if result.get("learning_sample_error") else ""))
+        if self.pot_button.isChecked():
+            self.prepare_pot_detection()
+            if getattr(self,'pot_resume_after_calibration',False):
+                self.pot_resume_after_calibration=False
+                self.play_video()
+        self.canvas.update()
+
+    def on_calibration_failed(self,generation,message):
+        if generation!=self.media_generation:return
+        backup=getattr(self,'_calibration_backup',None)
+        if backup:
+            self.canvas.set_frame(backup['frame'])
+            for key,value in backup.items():
+                if key not in ('frame','_main'):setattr(self.canvas,key,value)
+            for key,value in backup.get('_main',{}).items():setattr(self,key,value)
+            polygon=self.canvas.calibration_polygon
+            self.single_table_polygon=polygon
+            if self.yolo_worker is not None:
+                self.yolo_worker.calibration_polygon=polygon
+                self.yolo_worker.scope_polygon=self.canvas.recognition_polygon
+            self.last_pocket_result=self.canvas.pocket_result
+            self.canvas.pockets_available.emit(self.canvas.pocket_result is not None)
+            self.canvas.calibrate_coordinates()
+            self.start_camera_alignment()
+            self.load_exam_marks()
+            self.canvas.update()
+        self._calibration_backup=None
+        self.yolo_busy=False
+        self.calibration_controls(False)
+        self.statusBar().showMessage(f"校准未通过：{message}；原识别结果已保留，可再次校准或手动修正")
 
     def toggle_coordinates(self,enabled):
         self.canvas.coordinate_mode=enabled
@@ -661,14 +1438,26 @@ class MainWindow(QMainWindow):
         self.canvas.update()
 
     def invalidate_results(self):
+        self.camera_alignment=None;self.camera_geometry=None
+        self.close_exam()
+        self.canvas.exam_circles=[]
+        self.calibration_state_label.setText("校准：尚未加载")
+        self.reset_pot_session("来源或校准已改变")
+        self.canvas.calibration_polygon=None
+        self.canvas.recognition_polygon=None
+        self.single_table_polygon=None
+        if self.yolo_worker is not None:
+            self.yolo_worker.calibration_polygon=None
+            self.yolo_worker.scope_polygon=None
         self.track_recorder.close();self.canvas.track_paths={}
         self.selected_targets.clear();self.canvas.marked_ids.clear();self.pending_selection=None
+        self.resume_after_selection=False;self.selection_busy=False
         self.detection_mode="idle"
         self.live_tracking.clear()
         self.live_selected_id=None
         self.canvas.coordinates=None
         self.canvas.coordinate_ball=None
-        if self.canvas.coordinate_mode:self.coordinate_readout.setText("等待当前画面内库定位")
+        if self.canvas.coordinate_mode:self.coordinate_readout.setText("等待当前画面台面定位")
         self.ball_coordinate_readout.setText("球心：未选择")
         self.media_generation += 1
         self.last_pocket_result = None
@@ -679,21 +1468,36 @@ class MainWindow(QMainWindow):
 
     def update_navigation(self):
         images = self.media_mode == "images"
-        self.previous_button.setEnabled(images and self.image_index > 0)
-        self.next_button.setEnabled(images and self.image_index + 1 < len(self.image_paths))
-        self.previous_shortcut.setEnabled(images)
-        self.next_shortcut.setEnabled(images)
+        position=self.image_index if images else self.video_index
+        count=len(self.image_paths) if images else len(self.video_paths)
+        self.previous_button.setEnabled(position>0)
+        self.next_button.setEnabled(position+1<count)
+        self.previous_shortcut.setEnabled(True)
+        self.next_shortcut.setEnabled(True)
+        self.previous_button.setText("← 上一张" if images else "← 上一个")
+        self.next_button.setText("下一张 →" if images else "下一个 →")
         if images and self.image_index >= 0:
             self.image_info.setText(f"{self.image_index + 1} / {len(self.image_paths)} · {self.image_paths[self.image_index].name}")
         elif images:
             self.image_info.setText("未找到样本图片")
         else:
-            self.image_info.setText(self.video_path.name)
-        self.play_button.setEnabled(not images and self.playback_ready and not self.timer.isActive())
-        self.pause_button.setEnabled(not images and self.playback_ready and self.timer.isActive())
+            self.image_info.setText(f"{self.video_index+1} / {len(self.video_paths)} · {self.video_path.name}")
+        self.update_playback_button()
         self.update_all_button()
 
+    def navigate_media(self,step):
+        if self.media_mode=="images":
+            self.show_image(self.image_index+step);return
+        index=self.video_index+step
+        if not 0<=index<len(self.video_paths):return
+        self.timer.stop()
+        if self.capture is not None:self.capture.release()
+        self.capture=None
+        self.video_index=index;self.video_path=self.video_paths[index]
+        self.switch_source(0)
+
     def switch_source(self, index):
+        self.update_pot_count(clear=True);self.pot_reset_count_on_play=False
         self.timer.stop()
         self.invalidate_results()
         self.media_mode = "images" if index == 1 else "video"
@@ -722,16 +1526,19 @@ class MainWindow(QMainWindow):
         fps = self.capture.get(cv2.CAP_PROP_FPS)
         self.next_frame()
         if not self.canvas.image.isNull():
+            self.restore_saved_calibration()
             self.playback_ready = True
             self.timer.setInterval(round(1000 / fps) if 1 <= fps <= 120 else 40)
-            self.play_video()
+            self.statusBar().showMessage(f"本地视频：{self.video_path.name} · 已就绪，点击播放开始")
         self.update_navigation()
+        if getattr(self,'_calibration_restore_note',None):self.statusBar().showMessage(self._calibration_restore_note)
 
     def show_image(self, index):
         if self.media_mode != "images" or not 0 <= index < len(self.image_paths):
             return
         self.timer.stop()
         self.invalidate_results()
+        self.update_pot_count(clear=True)
         self.image_index = index
         path = self.image_paths[index]
         try:
@@ -744,8 +1551,9 @@ class MainWindow(QMainWindow):
             self.show_error(f"无法打开图片 {path.name}：{exc}")
         else:
             self.canvas.set_frame(frame)
+            restored=self.restore_saved_calibration()
             self.playback_ready = True
-            self.statusBar().showMessage(f"样本图片：{path.name} · 点击“识别全部”或开启 YOLO 后点选")
+            self.statusBar().showMessage(f"样本图片：{path.name} · " + (self._calibration_restore_note if restored else getattr(self,'_calibration_restore_note',None) or "点击“识别全部”或开启 YOLO 后点选"))
         self.update_navigation()
 
     def toggle_yolo(self, enabled):
@@ -758,6 +1566,8 @@ class MainWindow(QMainWindow):
         if not enabled:
             self.track_recorder.close();self.canvas.track_paths={}
             self.selected_targets.clear();self.canvas.marked_ids.clear();self.pending_selection=None
+            self.resume_after_selection=False
+            self.update_playback_button()
             self.detection_mode="idle"
             self.live_tracking.clear()
             self.live_selected_id=None
@@ -775,6 +1585,8 @@ class MainWindow(QMainWindow):
         if self.yolo_thread is None:
             self.yolo_thread = QThread(self)
             self.yolo_worker = YoloWorker()
+            self.yolo_worker.calibration_polygon=self.canvas.calibration_polygon
+            self.yolo_worker.scope_polygon=self.canvas.recognition_polygon
             self.yolo_worker.moveToThread(self.yolo_thread)
             self.yolo_thread.finished.connect(self.yolo_worker.deleteLater)
             self.identify_requested.connect(self.yolo_worker.identify)
@@ -782,6 +1594,7 @@ class MainWindow(QMainWindow):
             self.live_requested.connect(self.yolo_worker.identify_live)
             self.load_requested.connect(self.yolo_worker.load)
             self.yolo_worker.ready.connect(self.on_yolo_ready)
+            self.yolo_worker.geometry_ready.connect(self.on_yolo_geometry)
             self.yolo_worker.result.connect(self.on_yolo_result)
             self.yolo_worker.all_result.connect(self.on_yolo_all_result)
             self.yolo_worker.live_result.connect(self.on_live_result)
@@ -796,6 +1609,7 @@ class MainWindow(QMainWindow):
     def on_yolo_ready(self):
         self.yolo_ready = True
         self.yolo_loading = False
+        if self.calibration_busy:return
         self.update_all_button()
         if self.pending_all is not None:
             frame, generation = self.pending_all
@@ -808,7 +1622,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("YOLO 已开启，点击视频中的物体；可暂停后选择")
 
     def live_active(self):
-        return self.media_mode=="video" and self.timer.isActive() and self.yolo_button.isChecked() and self.detection_mode!="idle"
+        return self.media_mode=="video" and self.timer.isActive() and self.yolo_button.isChecked() and (self.detection_mode!="idle" or self.automatic_trails())
 
     def maybe_submit_live(self):
         if not self.live_active() or not self.yolo_ready or self.yolo_loading or self.yolo_busy or self.canvas.frame is None:
@@ -817,15 +1631,56 @@ class MainWindow(QMainWindow):
             self.live_tracking.push(self.live_frame_id,self.canvas.frame)
         self.live_token+=1
         self.live_inflight=(self.live_token,self.yolo_generation,self.live_frame_id,time.monotonic())
+        payload=self.canvas.frame.copy()
         self.yolo_busy=True
         self.update_all_button()
-        payload=self.canvas.frame.copy()
-        if self.detection_mode=="single":
-            targets=list(self.selected_targets.values())
+        if self.detection_mode=="single" and not self.automatic_trails() and not self.pot_button.isChecked():
+            targets=[]
+            for key,target in self.selected_targets.items():
+                target=dict(target);state=self.live_tracking.identities.states.get(key)
+                if state is not None:
+                    if state['appearance'] is not None:target['_appearance']=state['appearance'].tolist()
+                    if state['status']=='lost':
+                        dt=min(12,max(0,self.live_frame_id-state['frame']))
+                        position=state['center']+state['velocity']*dt;half=state['size']/2
+                        target['box']=[*(position-half).tolist(),*(position+half).tolist()]
+                targets.append(target)
             if not targets:
                 self.yolo_busy=False;self.live_inflight=None;self.update_all_button();return
             payload={"frame":payload,"target":targets[0]} if len(targets)==1 else {"frame":payload,"targets":targets}
         self.live_requested.emit(payload,self.live_token)
+
+    def adopt_initial_geometry(self,detections):
+        if self.canvas.calibration_polygon is not None:return
+        table=next((d for d in detections if d.get('calibration_evidence')),None)
+        if table is None:return
+        evidence=table['calibration_evidence']
+        metrics=evidence['metrics']
+        if not metrics['reliable'] or metrics['observed']!=6:return
+        path=self.calibration_profile_path()
+        if path.exists():return  # Human annotations require explicit correction feedback.
+        polygon=evidence['polygon']
+        self.canvas.calibration_polygon=polygon;self.single_table_polygon=polygon
+        self.canvas.recognition_polygon=evidence['pockets']['table'].get('scope_polygon') or polygon
+        self.canvas.calibrate_coordinates()
+        self.canvas.set_pocket_result(evidence['pockets']);self.last_pocket_result=evidence['pockets']
+        if self.yolo_worker is not None:
+            self.yolo_worker.calibration_polygon=polygon
+            self.yolo_worker.scope_polygon=self.canvas.recognition_polygon
+        self.load_exam_marks()
+        report={'attempt':0,'candidate_count':1,'decision':'initial','strategy':'validated_first_detection',
+                'before':None,'after':metrics,'reason':'首次自动识别通过台呢、黑边和六袋口验证'}
+        try:
+            from src.calibration_state import save_automatic
+            save_automatic(path.with_suffix('.auto.json'),self.canvas.frame,
+                           {'polygon':polygon,'pockets':evidence['pockets'],'calibration_report':report},None)
+        except (OSError,ValueError) as exc:print(f'自动识别配置保存失败：{exc}',file=sys.stderr,flush=True)
+        self.refresh_calibration_state()
+        self.start_camera_alignment()
+
+    def on_yolo_geometry(self,generation,table):
+        if not self.calibration_busy and generation==self.yolo_generation and self.yolo_button.isChecked():
+            self.adopt_initial_geometry([table])
 
     def on_live_result(self,token,detections):
         request=self.live_inflight
@@ -834,13 +1689,17 @@ class MainWindow(QMainWindow):
         self.update_all_button()
         if self.pending_selection is not None:
             frame,x,y,epoch=self.pending_selection;self.pending_selection=None
-            if epoch==self.yolo_generation:self.identify_element(frame,x,y)
+            if epoch==self.yolo_generation:
+                resume=self.resume_after_selection
+                self.identify_element(frame,x,y)
+                self.resume_after_selection=resume
             return
         if not self.yolo_button.isChecked() or request[1]!=self.yolo_generation:
             self.maybe_submit_live();return
         # Never apply a result older than the bounded frame history.
         if self.live_tracking.replace(request[2],detections):
-            if self.detection_mode=="single":
+            self.adopt_initial_geometry(detections)
+            if self.detection_mode=="single" and not self.automatic_trails():
                 self.live_tracking.detections=[item for item in self.live_tracking.detections if item.get("track_id") in self.selected_targets]
             self.canvas.set_detections(self.live_tracking.detections)
             self.render_live_selection()
@@ -849,10 +1708,12 @@ class MainWindow(QMainWindow):
             rate=1/(now-self.live_last_result_time) if self.live_last_result_time else 0.
             self.live_last_result_time=now
             suffix=f" · 推理更新 {rate:.1f} 次/秒" if rate else ""
-            self.statusBar().showMessage(f"YOLO 实时识别：{len(detections)} 个目标{suffix} · 播放与推理独立")
+            mode="播放与推理独立"
+            self.statusBar().showMessage(f"YOLO 实时识别：{len(detections)} 个目标{suffix} · {mode}")
         # The next video tick submits only the newest frame; no FIFO of images.
 
     def on_live_error(self,token,message):
+        if self.calibration_busy:return
         request=self.live_inflight
         if request is None or token!=request[0]:return
         self.live_inflight=None;self.yolo_busy=False
@@ -898,6 +1759,10 @@ class MainWindow(QMainWindow):
         if not self.selected_targets:self.ball_coordinate_readout.setText("未选择目标")
 
     def render_live_selection(self):
+        self.canvas.show_ball_boxes=self.detection_mode=="all" or self.detection_mode=="single" and not self.automatic_trails()
+        if self.automatic_trails():
+            self.canvas.selected_box=None;self.canvas.selected_polygon=None;self.canvas.marked_ids.clear()
+            return
         for item in self.live_tracking.detections:
             if item.get('track_id') in self.selected_targets:self.selected_targets[item['track_id']]=item
         self.canvas.marked_ids=set(self.selected_targets)
@@ -911,12 +1776,7 @@ class MainWindow(QMainWindow):
         identity=f" B{item['ball_id']}" if item.get("ball_id") else ""
         self.canvas.selected_label=f"{label}{identity} {item['confidence']:.0%}"
         if item['name']!='billiards_table':
-            table=next((d for d in self.live_tracking.detections if d['name']=='billiards_table'),None)
-            if table and table.get('playable_polygon'):
-                try:self.canvas.coordinates=TableCoordinates(table['playable_polygon'],self.canvas.dimensions)
-                except (ValueError,cv2.error):self.canvas.coordinates=None
-            elif self.single_table_polygon:
-                self.canvas.coordinates=TableCoordinates(self.single_table_polygon,self.canvas.dimensions)
+            self.canvas.calibrate_coordinates()
             position=self.canvas.coordinates.ball_center(item['box']) if self.canvas.coordinates else None
             self.canvas.coordinate_ball=position
             self.ball_coordinate_readout.setText(f"已选 {len(self.selected_targets)} 个 | {label}：X = {position[0]:.1f} mm，Y = {position[1]:.1f} mm" if position else f"已选 {len(self.selected_targets)} 个目标")
@@ -928,32 +1788,11 @@ class MainWindow(QMainWindow):
         self.pocket_button.setEnabled(self.playback_ready and not self.pocket_busy)
 
     def detect_pockets(self):
-        if not self.playback_ready or self.canvas.frame is None or self.pocket_busy:
-            return
-        self.pause_video()
-        frame = self.canvas.frame.copy()
-        self.canvas.clear_pockets()
-        self.last_pocket_result = None
-        self.pocket_busy = True
-        self.update_pocket_button()
-        self.statusBar().showMessage("正在独立检测球桌和袋口，并保存调试结果…")
-        if self.pocket_thread is None:
-            self.pocket_thread = QThread(self)
-            self.pocket_worker = PocketWorker()
-            self.pocket_worker.moveToThread(self.pocket_thread)
-            self.pocket_thread.finished.connect(self.pocket_worker.deleteLater)
-            self.pocket_requested.connect(self.pocket_worker.detect)
-            self.pocket_worker.done.connect(self.on_pocket_result)
-            self.pocket_worker.failed.connect(self.on_pocket_error)
-            self.pocket_thread.start()
-        if self.media_mode == 'images':
-            source = {'kind':'image', 'path':str(self.image_paths[self.image_index])}
-        else:
-            source = {'kind':'video', 'path':str(self.video_path),
-                      'frame_index':max(0,int(self.capture.get(cv2.CAP_PROP_POS_FRAMES))-1)}
-        self.pocket_requested.emit(frame, self.media_generation, source)
+        if self.calibration_busy or not self.playback_ready or self.canvas.frame is None:return
+        self.calibrate_table()
 
     def on_pocket_result(self, generation, result):
+        if self.calibration_busy:return
         self.pocket_busy = False
         self.update_pocket_button()
         if generation != self.media_generation:
@@ -971,41 +1810,52 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message + f" · JSON：{Path(path).parent.name}/result.json")
 
     def on_pocket_error(self, generation, message):
+        if self.calibration_busy:return
         self.pocket_busy = False
         self.update_pocket_button()
         if generation == self.media_generation:
             self.statusBar().showMessage(f"袋口检测或保存失败：{message}")
 
     def update_all_button(self):
+        if self.calibration_busy:return
         self.update_pocket_button()
-        text = "加载中…" if self.yolo_loading else "识别全部" if self.detection_mode=="single" else "实时识别中" if self.live_active() else "识别中…" if self.yolo_busy else "识别全部"
-        self.identify_all_button.setText(text)
-        self.identify_all_button.setEnabled(self.playback_ready and not self.yolo_loading and (not self.yolo_busy or self.live_active()))
+        self.canvas.show_ball_boxes=self.detection_mode=="all" or self.detection_mode=="single" and not self.automatic_trails()
+        active=self.detection_mode=="all"
+        self.identify_all_button.setText("取消识别" if active else "全部识别")
+        self.identify_all_button.setEnabled(self.playback_ready and (active or not self.yolo_loading and not self.yolo_busy))
 
     def identify_all_elements(self):
-        self.ball_coordinate_readout.setText("球心：未选择")
-        if not self.playback_ready or self.canvas.frame is None or (self.yolo_busy and not self.live_active()):
+        if self.calibration_busy:return
+        if self.detection_mode=="all":
+            self.yolo_generation+=1
+            self.pending_all=None;self.pending_selection=None
+            self.detection_mode="idle"
+            self.trails_button.setCurrentIndex(4)
+            self.selected_targets.clear();self.live_selected_id=None
+            self.live_tracking.clear()
+            self.canvas.clear_selection();self.canvas.track_paths={};self.canvas.marked_ids.clear()
+            self.canvas.coordinate_ball=None
+            self.ball_coordinate_readout.setText("球心：未选择")
+            self.canvas.update();self.update_all_button()
+            self.statusBar().showMessage("已取消全部识别")
             return
-        if self.detection_mode!="all":self.yolo_generation+=1
+        if not self.playback_ready or self.canvas.frame is None or self.yolo_busy:return
+        self.yolo_generation+=1
         self.detection_mode="all"
-        self.live_tracking.frames=deque(self.live_tracking.frames,maxlen=16)
+        self.live_tracking.clear()
         self.selected_targets.clear();self.canvas.marked_ids.clear()
         self.live_selected_id=None
+        self.canvas.clear_selection();self.canvas.track_paths={}
+        self.ball_coordinate_readout.setText("球心：未选择")
+        if not self.yolo_button.isChecked():self.yolo_button.setChecked(True)
         if self.media_mode=="video" and self.timer.isActive():
-            if not self.yolo_button.isChecked():self.yolo_button.setChecked(True)
-            self.maybe_submit_live()
+            self.update_all_button();self.maybe_submit_live()
             return
-        frame = self.canvas.frame.copy()
-        self.canvas.set_frame(frame, keep_pockets=True)
-        if not self.yolo_button.isChecked():
-            self.yolo_button.setChecked(True)
-        elif not self.yolo_ready and not self.yolo_loading:
-            self.toggle_yolo(True)
-        if self.yolo_ready:
-            self.submit_all(frame, self.yolo_generation)
-        else:
-            self.pending_all = (frame, self.yolo_generation)
-            self.statusBar().showMessage("正在加载 YOLO，随后识别已暂停的当前画面…")
+        frame=self.canvas.frame.copy()
+        if not self.yolo_ready and not self.yolo_loading:self.toggle_yolo(True)
+        if self.yolo_ready:self.submit_all(frame,self.yolo_generation)
+        else:self.pending_all=(frame,self.yolo_generation)
+        self.update_all_button()
 
     def submit_all(self, frame, generation):
         self.yolo_busy = True
@@ -1014,10 +1864,12 @@ class MainWindow(QMainWindow):
         self.identify_all_requested.emit(frame, generation)
 
     def on_yolo_all_result(self, generation, detections):
+        if self.calibration_busy:return
         self.yolo_busy = False
         self.update_all_button()
         if not self.yolo_button.isChecked() or generation != self.yolo_generation:
             return
+        self.adopt_initial_geometry(detections)
         self.canvas.set_detections(detections)
         if detections:
             counts = {}
@@ -1030,6 +1882,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("当前画面未可靠定位台球桌，请换一帧重试")
 
     def identify_element(self, frame, x, y):
+        if self.calibration_busy:return
         from src.table_geometry import contains_point
         # Toggling a known selection does not wait for an inference request.
         matches=[d for d in self.selected_targets.values() if contains_point(d,x,y)]
@@ -1043,11 +1896,13 @@ class MainWindow(QMainWindow):
         if self.yolo_busy:
             self.pending_selection=(frame.copy(),x,y,self.yolo_generation)
             return
-        self.yolo_busy=True;self.update_all_button()
+        self.yolo_busy=True;self.selection_busy=True;self.update_all_button()
         self.ball_coordinate_readout.setText(f"已选 {len(self.selected_targets)} 个 · 正在识别新目标…")
         self.identify_requested.emit(frame,x,y,self.yolo_generation)
 
     def on_yolo_result(self, generation, name, confidence, box=None, polygon=None):
+        if self.calibration_busy:return
+        self.selection_busy=False
         self.yolo_busy = False
         self.update_all_button()
         if not self.yolo_button.isChecked():
@@ -1059,10 +1914,17 @@ class MainWindow(QMainWindow):
             if self.canvas.coordinates is None:self.canvas.calibrate_coordinates()
             if self.canvas.coordinates:self.single_table_polygon=self.canvas.coordinates.corners.tolist()
             self.toggle_target({'name':name,'confidence':confidence,'box':box,'polygon':polygon})
+            if self.resume_after_selection:
+                self.resume_after_selection=False;self.play_video()
         else:
+            self.resume_after_selection=False
+            self.update_playback_button()
             self.ball_coordinate_readout.setText(f"已选 {len(self.selected_targets)} 个 · 点击处未识别到目标")
 
     def on_yolo_error(self, generation, message):
+        if self.calibration_busy:return
+        self.selection_busy=False;self.resume_after_selection=False
+        self.update_playback_button()
         self.yolo_busy = False
         self.pending_all = None
         if generation == -1:
@@ -1076,14 +1938,34 @@ class MainWindow(QMainWindow):
         elif self.yolo_button.isChecked():
             self.statusBar().showMessage("YOLO 已开启，点击视频中的物体；可暂停后选择")
 
+    def update_playback_button(self):
+        playing=self.timer.isActive() or self.resume_after_selection
+        self.play_button.setText("暂停" if playing else "播放")
+        self.play_button.setAccessibleName("暂停视频" if playing else "播放视频")
+        self.play_button.setEnabled(self.media_mode=="video" and self.playback_ready and not self.calibration_busy)
+
+    def toggle_playback(self):
+        if self.timer.isActive() or self.resume_after_selection:self.pause_video()
+        else:self.play_video()
+
     def play_video(self):
+        if self.calibration_busy:return
+        if self.pot_reset_count_on_play:
+            self.update_pot_count(clear=True);self.pot_reset_count_on_play=False
+        if self.pot_button.isChecked():self.prepare_pot_detection()
+        if self.selection_busy or self.pending_selection is not None:
+            self.resume_after_selection=True
+            self.update_playback_button()
+            self.statusBar().showMessage("正在确认所选球，完成后自动播放")
+            return
         self.ball_coordinate_readout.setText("球心：未选择")
         if self.media_mode == "images" or not self.playback_ready:
             return
         self.yolo_generation += 1
         self.media_generation += 1
-        self.last_pocket_result = None
-        self.canvas.clear_pockets()
+        if not self.canvas.calibration_polygon and not self.pot_button.isChecked():
+            self.last_pocket_result = None
+            self.canvas.clear_pockets()
         self.pending_all = None
         self.update_all_button()
         self.canvas.clear_selection()
@@ -1091,16 +1973,15 @@ class MainWindow(QMainWindow):
             self.live_tracking.clear();self.live_selected_id=None
         self.timer.start()
         self.maybe_submit_live()
-        self.play_button.setEnabled(False)
-        self.pause_button.setEnabled(True)
-        self.statusBar().showMessage(f"本地视频：{self.video_path.name} · 正在循环播放")
+        self.update_playback_button()
+        self.statusBar().showMessage(f"本地视频：{self.video_path.name} · 正在播放")
 
     def pause_video(self):
+        self.resume_after_selection=False
         if self.media_mode == "images" or not self.playback_ready:
             return
         self.timer.stop()
-        self.play_button.setEnabled(True)
-        self.pause_button.setEnabled(False)
+        self.update_playback_button()
         self.statusBar().showMessage(f"本地视频：{self.video_path.name} · 已暂停")
 
     def show_error(self, message):
@@ -1108,32 +1989,52 @@ class MainWindow(QMainWindow):
         self.playback_ready = False
         self.pending_all = None
         self.update_all_button()
-        self.play_button.setEnabled(False)
-        self.pause_button.setEnabled(False)
+        self.update_playback_button()
         self.canvas.message = message
         self.canvas.update()
         self.statusBar().showMessage("图片加载失败" if self.media_mode == "images" else "视频播放失败")
         print(message, file=sys.stderr, flush=True)
 
     def next_frame(self):
+        if self.calibration_busy:return
         self.ball_coordinate_readout.setText("球心：未选择")
         self.media_generation += 1
-        self.last_pocket_result = None
+        if not self.canvas.calibration_polygon and not self.pot_button.isChecked():self.last_pocket_result = None
         ok, frame = self.capture.read()
-        if not ok:
-            self.yolo_generation+=1
-            self.live_tracking.clear();self.live_selected_id=None
-            if self.detection_mode=="single":
-                self.detection_mode="idle";self.selected_targets.clear();self.canvas.marked_ids.clear()
-            self.capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ok, frame = self.capture.read()
+        ended=not ok
+        ended_pot_text=None
+        if ended:
+            self.timer.stop()
+            if self.pot_adapter is not None:
+                engine=self.pot_adapter.engine
+                if not engine.completed:
+                    results=engine.finish(force_unknown='recording_ended_before_final_review')
+                    self.update_pot_count(results)
+                    if self.pot_recording:self.pot_recording.write(engine.snapshot(),results,self.canvas.frame)
+                words={'POTTED':'已进袋','NOT_POTTED':'未进袋'}
+                ended_pot_text='本段结束 · '+' | '.join(title+'：'+words.get(engine.states[ball].state.value,'无法确认，需要人工复核')
+                    for ball,title in (('black_ball','黑球'),('white_ball','白球')))+' · 重播将重新观察'
+            self.invalidate_results()
+            self.capture.set(cv2.CAP_PROP_POS_FRAMES,0)
+            ok,frame=self.capture.read()
         if not ok:
             self.canvas.image = QImage()
             self.show_error("无法读取视频帧，请检查视频文件是否完整。")
             return
+        if ended:
+            self.canvas.set_frame(frame)
+            self.restore_saved_calibration()
+            self.update_navigation()
+            self.statusBar().showMessage("播放完毕 · 已回到首帧，点击播放可重播")
+            if ended_pot_text:self.pot_readout.setText(ended_pot_text)
+            self.pot_reset_count_on_play=True
+            return
+        self.update_camera_alignment(frame)
+        self.observe_current_pot_frame(frame)
         self.live_frame_id+=1
-        tracked=self.live_tracking.push(self.live_frame_id,frame) if self.yolo_button.isChecked() else []
-        self.canvas.set_frame(frame)
+        visual_tracking=self.yolo_button.isChecked() and (not self.pot_button.isChecked() or self.automatic_trails() or self.detection_mode!="idle")
+        tracked=self.live_tracking.push(self.live_frame_id,frame) if visual_tracking else []
+        self.canvas.set_frame(frame,keep_pockets=bool(self.canvas.calibration_polygon) or self.pot_button.isChecked())
         if self.yolo_button.isChecked():
             self.canvas.set_detections(tracked)
             self.render_live_selection()
@@ -1141,6 +2042,8 @@ class MainWindow(QMainWindow):
             self.maybe_submit_live()
 
     def closeEvent(self, event):
+        self.close_exam()
+        self.reset_pot_session("软件关闭")
         self.track_recorder.close()
         self.timer.stop()
         if self.capture is not None:
@@ -1151,6 +2054,9 @@ class MainWindow(QMainWindow):
             self.yolo_thread.quit()
             self.yolo_thread.wait()
             self.yolo_worker.shutdown()
+        if self.calibration_thread is not None:
+            self.calibration_thread.quit()
+            self.calibration_thread.wait()
         if self.pocket_thread is not None:
             self.pocket_thread.requestInterruption()
             self.pocket_thread.quit()

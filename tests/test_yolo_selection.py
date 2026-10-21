@@ -84,7 +84,7 @@ def test_identify_all_and_discard_results_after_play_or_disable(app, tmp_path):
         window.update_all_button()
         window.identify_all_button.click()
         assert window.yolo_button.isChecked() and not window.timer.isActive()
-        assert len(requests) == 1 and not window.identify_all_button.isEnabled()
+        assert len(requests) == 1 and window.identify_all_button.isEnabled()
         generation = requests[0][1]
         detections = [
             {'name': 'billiards_table', 'confidence': .9, 'box': [0, 0, 1900, 1000]},

@@ -3,6 +3,7 @@ from collections import deque
 import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
+from .ball_observation import BALL_NAMES
 
 
 def center(item):return np.mean(np.array(item['box'],float).reshape(2,2),axis=0)
@@ -33,7 +34,7 @@ class BallTracks:
         return float(cv2.compareHist(a.astype(np.float32),b.astype(np.float32),cv2.HISTCMP_BHATTACHARYYA))
 
     def update(self,frame_id,frame,items,appearance_scale=1.):
-        balls=[dict(d) for d in items if d['name']!='billiards_table']
+        balls=[dict(d) for d in items if d['name'] in BALL_NAMES]
         # Suppress duplicate local-crop reports of the same physical object.
         unique=[]
         for item in balls:
@@ -49,7 +50,9 @@ class BallTracks:
                 if item['name']!=state['name']:continue
                 size=max(8.,state['size']);distance=float(np.linalg.norm(center(item)-predicted))
                 colour=self.distance(state['appearance'],descriptors[j])
-                if distance>size*(2+min(dt,15)*.5) or colour>.65:continue
+                observed_hint=hint==key and item.get('_ball_observed') and dt<=3
+                if distance>size*((6 if observed_hint else 2)+min(dt,15)*.5):continue
+                if colour>.65 and not (item.get("_pocket_continuity") and hint==key):continue
                 costs[i,j]=distance/size+.9*colour
         matches={}
         if costs.size:
