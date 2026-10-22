@@ -54,7 +54,7 @@
 切换回原录像：
 
 ```bash
-./scripts/start_dev.sh --video /Users/joey/projects/billiards-vision/data/billiards_table.mp4
+./scripts/start_dev.sh --video data/billiards_table.mp4
 ```
 
 更早的海康演示素材为 `data/hikvision_demo.mp4`；SDK 说明见 `HIKVISION_SDK.md`。

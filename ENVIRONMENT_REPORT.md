@@ -1,11 +1,11 @@
 # Environment Report
 
 验证日期：2026-10-13（Asia/Shanghai）  
-项目路径：`/Users/joey/projects/billiards-vision`
+路径约定：以下均相对于仓库根目录。
 Platform: macOS 27.0.1 / ARM64  
 阶段：第一阶段，开发环境初始化。
 
-目录迁移（2026-10-13）：项目已完整迁移到 `/Users/joey/projects/billiards-vision`，包含 Git 历史、独立 Python 运行时、虚拟环境、模型、数据、日志及本地新增文件。已修复虚拟环境中的绝对路径，迁移后 Python 3.10.20、pip、环境检查、OpenCV、PyQt5 原生窗口、YOLO、8 项 Import 测试和 pip check 全部通过。原中文项目目录已移除。
+环境迁移验证（2026-10-13）：已修复虚拟环境中的路径引用，Python 3.10.20、pip、环境检查、OpenCV、PyQt5 原生窗口、YOLO、8 项 Import 测试和 pip check 全部通过。
 
 ## Python
 

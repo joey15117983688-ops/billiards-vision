@@ -1,0 +1,279 @@
+{
+  "schema_version": 1,
+  "seed": 20261022,
+  "profiles": {
+    "normal": {
+      "kind": "identity"
+    },
+    "red": {
+      "kind": "gain",
+      "rgb_gain": [
+        3,
+        0.3,
+        0.35
+      ]
+    },
+    "blue": {
+      "kind": "gain",
+      "rgb_gain": [
+        0.35,
+        0.4,
+        3
+      ]
+    },
+    "purple": {
+      "kind": "gain",
+      "rgb_gain": [
+        1.8,
+        0.3,
+        2
+      ]
+    },
+    "cyan": {
+      "kind": "gain",
+      "rgb_gain": [
+        0.4,
+        1.1,
+        1.8
+      ]
+    },
+    "local_red": {
+      "kind": "spot",
+      "center": [
+        0.86,
+        0.1
+      ],
+      "radius": [
+        0.22,
+        0.16
+      ],
+      "rgb_add": [
+        220,
+        0,
+        0
+      ]
+    },
+    "slow_color": {
+      "kind": "slow",
+      "rgb_amplitude": [
+        0.8,
+        -0.65,
+        0.6
+      ]
+    },
+    "flicker": {
+      "kind": "flicker",
+      "hz": 2,
+      "low": 0.15,
+      "high": 1.4,
+      "duty": 0.6
+    },
+    "pocket_highlight": {
+      "kind": "highlight",
+      "center": [
+        0.87,
+        0.5
+      ],
+      "radius": [
+        0.18,
+        0.14
+      ],
+      "rgb_add": [
+        420,
+        420,
+        420
+      ]
+    },
+    "shadow": {
+      "kind": "shadow",
+      "center": [
+        0.5,
+        0.5
+      ],
+      "radius": [
+        0.35,
+        0.3
+      ],
+      "strength": 0.94
+    },
+    "gradient": {
+      "kind": "gradient",
+      "top": 0.15,
+      "bottom": 1.1
+    },
+    "mixed": {
+      "kind": "mixed",
+      "left_rgb_gain": [
+        2.5,
+        0.4,
+        0.4
+      ],
+      "right_rgb_gain": [
+        0.4,
+        0.6,
+        2.5
+      ]
+    },
+    "noise": {
+      "kind": "noise",
+      "sigma": 18
+    }
+  },
+  "segments": [
+    {
+      "id": "green_approach",
+      "source": "data/test.mp4",
+      "sha256": "feb3ac6c3cb0a8eb52b02d08cc050f29cce04a8b6da78dd0c63eed245ad38ed9",
+      "start_seconds": 44,
+      "duration_seconds": 8,
+      "profiles": [
+        "normal",
+        "red",
+        "blue",
+        "purple",
+        "cyan",
+        "local_red",
+        "slow_color",
+        "flicker",
+        "pocket_highlight",
+        "shadow",
+        "gradient",
+        "mixed",
+        "noise"
+      ],
+      "calibration_reference": null,
+      "truth": {
+        "added_geometric_transform": "identity",
+        "geometry_relative_to_original": "unchanged_by_construction",
+        "original_camera_stationary": "unknown",
+        "black_ball_visibility": "unknown",
+        "white_ball_visibility": "unknown",
+        "real_occlusion": true,
+        "real_pot_events": "unknown",
+        "annotation_kind": "manual_minimal_review",
+        "review_method": "2026-10-22 source contact-sheet visual review; sparse review is not dense event ground truth",
+        "perturbed_ball_visibility": "unknown",
+        "manual_dense_ball_annotations": [],
+        "notes": "Moving balls, left-middle entrance and review window; existing baseline event last_seen=47.8s is an algorithm regression reference, not new manual truth. Arm/cue on cloth; pocket occlusion unknown."
+      }
+    },
+    {
+      "id": "green_late",
+      "source": "data/test.mp4",
+      "sha256": "feb3ac6c3cb0a8eb52b02d08cc050f29cce04a8b6da78dd0c63eed245ad38ed9",
+      "start_seconds": 312,
+      "duration_seconds": 8,
+      "profiles": [
+        "normal",
+        "red",
+        "local_red",
+        "flicker",
+        "pocket_highlight"
+      ],
+      "calibration_reference": "tests/fixtures/late_pot_calibration.json",
+      "truth": {
+        "added_geometric_transform": "identity",
+        "geometry_relative_to_original": "unchanged_by_construction",
+        "original_camera_stationary": "unknown",
+        "black_ball_visibility": "unknown",
+        "white_ball_visibility": "unknown",
+        "real_occlusion": true,
+        "real_pot_events": "unknown",
+        "annotation_kind": "manual_minimal_review",
+        "review_method": "2026-10-22 source contact-sheet visual review; sparse review is not dense event ground truth",
+        "perturbed_ball_visibility": "unknown",
+        "manual_dense_ball_annotations": [],
+        "notes": "Late black approach/absence/review window around315.6s from existing regression. Sparse visual review cannot certify every event."
+      }
+    },
+    {
+      "id": "blue_motion",
+      "source": "data/overhead_pool.mp4",
+      "sha256": "a158bdc4a241f55e92bf87953b34334e6e03ce952b0e0cb1da1e5c217a8400d5",
+      "start_seconds": 0,
+      "duration_seconds": 3,
+      "profiles": [
+        "normal",
+        "red",
+        "blue",
+        "purple",
+        "local_red",
+        "flicker",
+        "pocket_highlight"
+      ],
+      "calibration_reference": null,
+      "truth": {
+        "added_geometric_transform": "identity",
+        "geometry_relative_to_original": "unchanged_by_construction",
+        "original_camera_stationary": "unknown",
+        "black_ball_visibility": "unknown",
+        "white_ball_visibility": "unknown",
+        "real_occlusion": true,
+        "real_pot_events": "unknown",
+        "annotation_kind": "manual_minimal_review",
+        "review_method": "2026-10-22 source contact-sheet visual review; sparse review is not dense event ground truth",
+        "perturbed_ball_visibility": "unknown",
+        "manual_dense_ball_annotations": [],
+        "notes": "Blue cloth, moving balls, real arm/cue near lower-left rim. No independent pot truth."
+      }
+    },
+    {
+      "id": "angled_static",
+      "source": "data/billiards_table.mp4",
+      "sha256": "867b761b0afdf91f7ade34946927b85c4b80581eeaa795909c5b876031218a07",
+      "start_seconds": 0,
+      "duration_seconds": 3,
+      "profiles": [
+        "normal",
+        "red",
+        "local_red",
+        "flicker",
+        "pocket_highlight"
+      ],
+      "calibration_reference": null,
+      "truth": {
+        "added_geometric_transform": "identity",
+        "geometry_relative_to_original": "unchanged_by_construction",
+        "original_camera_stationary": "unknown",
+        "black_ball_visibility": "unknown",
+        "white_ball_visibility": "unknown",
+        "real_occlusion": "unknown",
+        "real_pot_events": "unknown",
+        "annotation_kind": "manual_minimal_review",
+        "review_method": "2026-10-22 source contact-sheet visual review; sparse review is not dense event ground truth",
+        "perturbed_ball_visibility": "unknown",
+        "manual_dense_ball_annotations": [],
+        "notes": "Angled table, balls appear static at0/1/2s; no dense stationary-two-ball certification. No arm visible in reviewed frames."
+      }
+    },
+    {
+      "id": "green_arm",
+      "source": "data/test.mp4",
+      "sha256": "feb3ac6c3cb0a8eb52b02d08cc050f29cce04a8b6da78dd0c63eed245ad38ed9",
+      "start_seconds": 0,
+      "duration_seconds": 3,
+      "profiles": [
+        "normal",
+        "red",
+        "local_red",
+        "flicker",
+        "pocket_highlight"
+      ],
+      "calibration_reference": null,
+      "truth": {
+        "added_geometric_transform": "identity",
+        "geometry_relative_to_original": "unchanged_by_construction",
+        "original_camera_stationary": "unknown",
+        "black_ball_visibility": "unknown",
+        "white_ball_visibility": "unknown",
+        "real_occlusion": true,
+        "real_pot_events": "unknown",
+        "annotation_kind": "manual_minimal_review",
+        "review_method": "2026-10-22 source contact-sheet visual review; sparse review is not dense event ground truth",
+        "perturbed_ball_visibility": "unknown",
+        "manual_dense_ball_annotations": [],
+        "notes": "Real hand/arm/cue on cloth; near-pocket obstruction not certified. Normal opening frame contains player, not labelled unobstructed."
+      }
+    }
+  ]
+}

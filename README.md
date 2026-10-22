@@ -13,23 +13,23 @@
 - **视频区域旋转**：横竖切换在当前视频区域内完成，保留其他操作控件。
 - **实时视频前期模块**：独立拉流、有界最新帧缓存、超时重连和质量/连续性诊断。主界面尚未接入真实赛场视频流，详见[实时视频前期方案](docs/live_video_preparation.md)。
 
-最新本地回归验证：249 项测试通过。实际新球房、摄像机和实时比赛的识别效果仍需实地验证，测试数量不代表识别准确率。
+最新回归验证：原有 249 项与新增光照测试 22 项分别运行通过。已建立 35 个连续光照测试片段的生成与诊断流程，详见 [光照测试说明](docs/LIGHTING_CASES.md) 和 [A 阶段报告](docs/LIGHTING_ROBUSTNESS_REPORT.md)。实际新球房、摄像机和实时比赛的识别效果仍需实地验证，测试数量不代表识别准确率。
 
 以下包含启动说明、环境资料和各阶段实现记录；当前交互以本节及文末最新说明为准。
 
 ## 启动项目窗口
 
-本机环境已创建，可直接执行，无需手动激活虚拟环境：
+完成环境准备后，从克隆得到的仓库目录启动，无需手动激活虚拟环境：
 
 ```bash
-cd /Users/joey/projects/billiards-vision
+cd billiards-vision
 ./scripts/start_dev.sh
 ```
 
-也可以从任意目录执行：
+也可以将 `PROJECT_ROOT` 设置为实际仓库目录，然后从任意目录执行：
 
 ```bash
-/Users/joey/projects/billiards-vision/scripts/start_dev.sh
+"$PROJECT_ROOT/scripts/start_dev.sh"
 ```
 
 当前入口为 `main.py`，默认打开样本图片模式，读取 `data/dataset/images/train` 的 76 张图片。底部左侧可切换“视频／样本图片”。图片模式使用上一张／下一张按钮或键盘左右方向键切换，显示当前序号和文件名；点击“识别全部”或开启 YOLO 后点选测试。图片模式不启动视频计时器，每次只加载一张图片。
@@ -105,7 +105,7 @@ YOLO 在独立后台进程中运行，避免本机 PyTorch 在 Qt 工作线程�
 如果已有 Python 3.10.20，直接使用，不重装、不修改系统 Python：
 
 ```bash
-cd /Users/joey/projects/billiards-vision
+cd billiards-vision
 python3.10 --version
 python3.10 -m venv .venv
 source .venv/bin/activate

@@ -117,7 +117,7 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest tests -q --durations=15 \
 
 完整会话资源曲线（含预热和收尾，图中坐标不应误解为测量窗内全部样本）：
 
-![组合模式资源曲线](/Users/joey/projects/billiards-vision/logs/engineering_baseline/20261021/combined_resources.png)
+曲线文件：`logs/engineering_baseline/20261021/combined_resources.png`（本地测量产物，未包含在公开仓库中）。
 
 ### 6.3 较长组合片段模块耗时
 
