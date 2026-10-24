@@ -1,4 +1,8 @@
 """Bounded optical-flow bridge between asynchronous YOLO results and displayed frames."""
+# YOLO 异步结果与显示帧之间的桥接；帧历史是有界低分辨率灰度/彩色图，不缓存整段视频。
+# 光流与模板用于寻找候选位置，彩色当前帧局部球体像素负责复核；失败就丢弃，不无限外推。
+# 延迟响应只可在仍保留的历史窗口内回放，历史已过期时返回失败。
+
 from collections import deque
 from copy import deepcopy
 import cv2
@@ -8,6 +12,7 @@ from .ball_observation import BALL_NAMES, closest_ball
 
 
 class LiveTracking:
+    # 建立有限历史和身份关联器；monitored_ids 用于短期丢失后的局部重新观察。
     def __init__(self, history_size=16):
         self.frames=deque(maxlen=history_size)
         self.detections=[]
@@ -16,16 +21,20 @@ class LiveTracking:
         self.current_color=None
         self.monitored_ids=set()
 
+    # 清空帧和当前检测，按 keep_tracks 决定是否保留身份容器，便于调用方区分暂停与换源。
     def clear(self,keep_tracks=False):
         self.frames.clear();self.detections=[];self.current_color=None;self.monitored_ids.clear()
         if not keep_tracks:self.identities=BallTracks()
 
+    # 最长边缩至 640，返回灰度、缩放比、原图尺寸和彩色小图；像素框需要按比例换算。
     @staticmethod
     def gray(frame):
         scale=min(1.,640/max(frame.shape[:2]))
         small=cv2.resize(frame,None,fx=scale,fy=scale) if scale<1 else frame
         return cv2.cvtColor(small,cv2.COLOR_BGR2GRAY),scale,frame.shape[:2],small
 
+    # 把上一帧目标传播到当前帧，并对失踪的监控球在预测邻域尝试局部像素复核。
+    # 分辨率变化直接清除旧历史；最后更新身份并追加有限历史，避免跨不同尺寸计算光流。
     def push(self,frame_id,frame):
         gray,scale,shape,small=self.gray(frame)
         self.current_color=frame
@@ -62,6 +71,8 @@ class LiveTracking:
         self.frames.append((frame_id,gray,scale,shape,small.copy()))
         return deepcopy(self.detections)
 
+    # 在比原框更大的邻域匹配图像模板，补充快速运动时的小窗口光流。
+    # 峰值不足或两个分离候选同样相似时拒绝，避免跳到相邻同色球。
     @staticmethod
     def patch_offset(previous,current,item,scale):
         x1,y1,x2,y2=np.asarray(item['box'])*scale
@@ -81,6 +92,8 @@ class LiveTracking:
         if float(scores.max())>peak-.04:return None
         return (np.asarray(location)+[sx-ax,sy-ay])/scale
 
+    # 球心区域提取角点求光流，结合模板与局部实测候选修正位置。
+    # 所有偏移还原到传入坐标尺度；当前彩色像素未复核成功的球不作为有效输出保留。
     @staticmethod
     def flow(previous,current,items,scale,shape,color=None):
         output=deepcopy(items);points=[];owners=[]
@@ -142,6 +155,8 @@ class LiveTracking:
                   cv2.pointPolygonTest(polygon,((d['box'][0]+d['box'][2])/2,(d['box'][1]+d['box'][3])/2),False)>=0]
         return keep
 
+    # 从模型请求帧沿保留历史逐帧对齐到最新帧，再将实测位置关联到身份。
+    # 只回填尚未被实时处理覆盖的路径区间；不重写已有观测，也不在历史窗口之外补猜轨迹。
     def replace(self,frame_id,items):
         history=list(self.frames)
         index=next((i for i,f in enumerate(history) if f[0]==frame_id),None)

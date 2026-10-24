@@ -1,13 +1,20 @@
 """Current-frame ball pixels on a calibrated cloth; no optical predictions."""
+# 当前帧球体像素观察器：以固定台面掩模限制范围，返回原图像素框和实际观测来源标记。
+# 缩图仅为控制逐帧成本；HSV 主色与亮度分类仍是既有启发式，不能声称彩灯或欠曝已可靠处理。
+
 import cv2
 import numpy as np
 
 
 class PixelBallObserver:
+    # 保存校准多边形，掩模等按首个实际输入尺寸延迟建立。
     def __init__(self,polygon):
         self.polygon=np.asarray(polygon,np.float32)
         self.cached_shape=None
 
+    # 最长边限制为 960；按台呢主色、饱和度和相对亮度构造前景，再筛尺寸/圆度。
+    # 轮廓树中孔洞不当作独立球；靠边和非球形组件被排除，最终框按 scale 还原到原图。
+    # white_ball/black_ball 来自当前区域亮度/饱和度规则，confidence=.85 不是校准概率。
     def observe(self,frame):
         scale=min(1.,960/max(frame.shape[:2]))
         image=cv2.resize(frame,None,fx=scale,fy=scale) if scale<1 else frame
@@ -19,6 +26,7 @@ class PixelBallObserver:
             self.mask=cv2.dilate(self.mask,np.ones((9,9),np.uint8))
             self.short=min(np.linalg.norm(np.roll(self.points,-1,axis=0)-self.points,axis=1))
         hsv=cv2.cvtColor(image,cv2.COLOR_BGR2HSV)
+        # 用台面内有足够饱和度/亮度的像素估计当前主色；这是现有全局启发式。
         samples=hsv[(self.mask>0)&(hsv[:,:,1]>65)&(hsv[:,:,2]>40)]
         if len(samples)<100:return []
         hue=int(np.argmax(np.bincount(samples[:,0],minlength=180)))
@@ -48,6 +56,7 @@ class PixelBallObserver:
             cv2.drawContours(region,[contour-np.array([[[x,y]]])],-1,255,-1)
             pixels=hsv[y:y+h,x:x+w][region>0]
             saturation,value=np.median(pixels[:,1:],axis=0)
+            # 颜色身份直接依赖本帧亮度/饱和度，强彩灯下可能换类，不能视为固定物理身份。
             name='white_ball' if saturation<85 and value>160 else 'black_ball' if value<80 else 'billiard_ball'
             found.append({'name':name,'box':[x/scale,y/scale,(x+w)/scale,(y+h)/scale],
                           'confidence':.85,'method':'current_frame_cloth_pixels'})

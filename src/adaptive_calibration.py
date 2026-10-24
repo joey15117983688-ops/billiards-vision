@@ -1,4 +1,7 @@
 """Bounded geometric search driven by explicit correction feedback and image evidence."""
+# 显式纠错时执行的有界候选搜索，不是每帧自动重校准。
+# 以台呢填充、深色边带、直线支持和袋口证据共同比较；分数是启发式，不是准确率或概率。
+
 from dataclasses import replace
 import cv2
 import numpy as np
@@ -7,6 +10,7 @@ from src.vision.pocket import PocketDetector, TableDetector, PocketConfig, Table
 from src.vision.pocket.table_detector import _line, _intersection
 
 
+# 用统一四角排序比较短边归一化位移，避免轮廓起始点不同导致误判为新边界。
 def same_polygon(a,b,tolerance=.006):
     if a is None or b is None:return False
     try:
@@ -16,6 +20,7 @@ def same_polygon(a,b,tolerance=.006):
     return bool(np.max(np.linalg.norm(a-b,axis=1))<max(2.,short*tolerance))
 
 
+# 沿各边法线移动指定距离，再求相邻直线交点；退化或不合法四边形返回 None。
 def shifted_polygon(polygon,offsets):
     q=TableCoordinates(polygon).corners.astype(float)
     lines=[]
@@ -30,6 +35,7 @@ def shifted_polygon(polygon,offsets):
 
 
 class ImageEvidence:
+    # 预计算缩小图像的 HSV、灰度边缘和亮度，供同帧多个候选复用。
     def __init__(self,frame):
         self.scale=min(1.,900/max(frame.shape[:2]))
         image=cv2.resize(frame,None,fx=self.scale,fy=self.scale) if self.scale<1 else frame
@@ -39,6 +45,7 @@ class ImageEvidence:
         self.edges=cv2.dilate(self.edges,np.ones((5,5),np.uint8))
         self.value=value
 
+    # 检查候选范围是否在图内，并统计台呢填充、边带黑色比例和四边直线支持。
     def measure(self,polygon):
         q=TableCoordinates(polygon).corners.astype(float)*self.scale
         h,w=self.value.shape
@@ -66,6 +73,7 @@ class ImageEvidence:
                 'edge_mean':float(np.mean(supports))}
 
 
+# 在指定内库上验证六袋，汇总候选分数与可靠性；不因颜色填充高就直接接受。
 def evaluate_candidate(frame,polygon,evidence,config):
     q=TableCoordinates(polygon).corners.tolist()
     metrics=evidence.measure(q)
@@ -84,6 +92,8 @@ def evaluate_candidate(frame,polygon,evidence,config):
     return {'polygon':q,'pockets':pockets,'metrics':metrics}
 
 
+# 剔除用户否定过的边界；有基准时要求袋口和综合证据改善，否则返回 unchanged。
+# 没有基准且没有合格候选则抛错，不能为了显示成功选择一个无依据四边形。
 def choose_correction(candidates,baseline,rejected,manual=False):
     eligible=[c for c in candidates if c['metrics']['reliable'] and
               not any(same_polygon(c['polygon'],q) for q in rejected)]
@@ -99,6 +109,8 @@ def choose_correction(candidates,baseline,rejected,manual=False):
     raise ValueError('无法可靠定位台呢内库：未找到通过台呢、黑边和袋口检查的候选，原结果保留')
 
 
+# 从多尺度/曝光候选生成种子，再有限扩展单边/对边/整体内外偏移。
+# 记录每个候选的证据与选择理由；重试扩大搜索范围，但失败不静默覆盖原边界。
 def search_calibration(frame,progress,context=None):
     context=context or {};attempt=max(1,int(context.get('attempt',1)))
     config=PocketConfig(hsv_ranges=PocketConfig().hsv_ranges+(

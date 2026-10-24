@@ -6,6 +6,10 @@ changed. Timing wrappers are installed only in this benchmark process. RSS is
 sampled every 250 ms for this process and its model child; one sampler thread is
 measurement overhead. Run one scenario per process, sequentially, when idle.
 """
+# 第一阶段统一性能口径：隔离配置运行已有模块/Qt/模型，不更改生产阈值或返回伪结果。
+# CPU 100% 表示一个核心时间；RSS 为主进程与子进程采样和，可能重复计入共享页。
+# 耗时有包含关系，不可把 next_frame、适配器、局部可见性各项直接相加；短测不能证明无泄漏。
+
 import argparse
 from collections import defaultdict
 from copy import deepcopy
@@ -27,11 +31,13 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 
 
+# 严格序列化测量结果到本次指定目录，拒绝非有限数值。
 def write_json(path,value):
     path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
     path.write_text(json.dumps(value,ensure_ascii=False,indent=2,allow_nan=False))
 
 
+# 保留样本数、均值、中位、P95 和极值，避免只挑最好的一次表现。
 def distribution(values):
     if not values:return {'count':0}
     values=np.asarray(values,float)
@@ -39,6 +45,7 @@ def distribution(values):
                 p95=float(np.percentile(values,95)),maximum=float(values.max()),minimum=float(values.min()))
 
 
+# 记录提交、架构、包版本及线程/内存条件，性能比较必须核对这些上下文。
 def environment():
     names=['numpy','opencv-python','PyQt5','torch','torchvision','ultralytics','scipy','psutil','pytest']
     versions={}
@@ -54,6 +61,7 @@ def environment():
 
 class Timings:
     def __init__(self):self.active=False;self.data=defaultdict(list)
+    # 仅在测量窗口启用计时；finally 保证异常调用也计入实际耗时。
     def wrap(self,label,method):
         def measured(*args,**kwargs):
             start=time.perf_counter()
@@ -61,13 +69,16 @@ class Timings:
             finally:
                 if self.active:self.data[label].append((time.perf_counter()-start)*1000)
         return measured
+    # 给本次诊断进程的方法装计时包装，不写回生产源文件。
     def patch(self,owner,name,label):setattr(owner,name,self.wrap(label,getattr(owner,name)))
+    # 按标签分别汇总，标签之间可能是嵌套调用，不能视为互斥时间。
     def summary(self):return {name:distribution(values) for name,values in self.data.items()}
 
 
 class Sampler:
     def __init__(self):
         self.process=psutil.Process();self.stop_event=threading.Event();self.rows=[];self.known={}
+    # 汇总本进程与当前子进程资源，消失/退出的进程允许跳过；RSS 不是瞬时绝对峰值。
     def sample(self):
         row={'wall':time.monotonic(),'rss_mib':0.,'cpu_percent':0.,'os_threads':0,'fds':0,'children':0,'main_rss_mib':0.}
         try:processes=[self.process,*self.process.children(recursive=True)]
@@ -85,11 +96,15 @@ class Sampler:
                 if process.pid==self.process.pid:row['main_rss_mib']=rss
             except psutil.Error:continue
         self.rows.append(row)
+    # 后台约每 250 ms 采样；采样器本身额外使用一个线程。
     def run(self):
         while not self.stop_event.is_set():self.sample();self.stop_event.wait(.25)
+    # 启动本次采集线程，不改变生产 worker 的执行线程数。
     def start(self):
         self.thread=threading.Thread(target=self.run,name='baseline-sampler',daemon=True);self.thread.start()
+    # 通知停止后补一次采样，收尾资源仍可记录在完整会话中。
     def stop(self):self.stop_event.set();self.thread.join(2);self.sample()
+    # 仅用实际测量窗中的采样计算均值/分位，同时单列完整会话峰值及分段内存变化。
     def summary(self,start,end):
         rows=[r for r in self.rows if start<=r['wall']<=end]
         result={k:distribution([r[k] for r in rows]) for k in ['rss_mib','main_rss_mib','cpu_percent','os_threads','fds','children']}
@@ -101,6 +116,7 @@ class Sampler:
         return result
 
 
+# 对固定原片测台面/袋口/完整校准，并用受控身份重建检查容器增长；不是实战准确率。
 def run_modules(args):
     from src.vision.pocket import TableDetector,PocketDetector
     from src.scene_calibration import calibrate_scene
@@ -148,6 +164,8 @@ def run_modules(args):
     write_json(args.output/'module_baseline.json',{'environment':environment(),'cases':cases,'identity_churn':churn})
 
 
+# 创建隔离目录，包装真实 Qt 入口和模型 worker，预热后按单调时钟测量。
+# 区分播放、像素观察及 YOLO 回包频率，末尾检查暂停/恢复/EOF/换源/资源释放。
 def run_ui(args):
     # Select Qt platform before importing PyQt5 or main.
     os.environ['QT_QPA_PLATFORM']=args.qt_platform
@@ -239,6 +257,7 @@ def run_ui(args):
     # Connections to worker slots are established only when YOLO is enabled.
     window.show()
 
+    # 预热结束后清空测量窗口计数并记录单调起点，不将模型加载时间混入稳态 FPS。
     def begin_measurement():
         context['start']=time.monotonic();context['media_start']=window.capture.get(cv2.CAP_PROP_POS_MSEC)/1000
         timings.active=True;QTimer.singleShot(round(args.seconds*1000),finish)
@@ -258,6 +277,7 @@ def run_ui(args):
             context['error']='model_start_timeout';window.close();sampler.stop();app.quit()
         else:QTimer.singleShot(50,await_model)
 
+    # 结束测量后执行正常生命周期检查、落盘指标并退出应用；不冒充挂死故障注入验收。
     def finish():
         timings.active=False;context['end']=time.monotonic()
         context['media_end']=window.capture.get(cv2.CAP_PROP_POS_MSEC)/1000
@@ -314,6 +334,7 @@ def run_ui(args):
         raise RuntimeError(context['error'] or 'measurement_incomplete')
 
 
+# 选择 modules/playback/pots/tracks/combined 等场景及独立输出目录；应串行运行避免互相抢资源。
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--scenario',choices=['modules','playback','pots','tracks','combined'],required=True)

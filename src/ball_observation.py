@@ -1,10 +1,15 @@
 """Local, colour-independent ball observations; reject elongated cue components."""
+# 以已有目标框为搜索提示，在当前 BGR 图中寻找局部球体；这里只返回像素观测，不运行 YOLO。
+# HSV 主色、轮廓和外观阈值是启发式，彩灯鲁棒性尚待后续阶段改进。
+
 import cv2
 import numpy as np
 
 BALL_NAMES = frozenset(('billiard_ball', 'white_ball', 'black_ball'))
 
 
+# 以目标球径限定裁剪和轮廓尺寸，排除台呢、细长杆体及接触裁剪边界的组件。
+# 运动模糊标记只放宽形状筛选；返回 _ball_observed 表示中心来自当前轮廓矩，而非预测中心。
 def local_balls(frame, target, radius_factor=2.5):
     x1,y1,x2,y2=target['box'];w,h=x2-x1,y2-y1
     if min(w,h)<=2 or max(w,h)/min(w,h)>2.2:return []
@@ -42,6 +47,7 @@ def local_balls(frame, target, radius_factor=2.5):
     return found
 
 
+# 结合像素候选到提示中心的距离与外观差异排序；歧义拒绝标记开启时不强行选一个。
 def closest_ball(frame,target,radius_factor=2.5):
     candidates=local_balls(frame,target,radius_factor)
     center=lambda d:np.mean(np.array(d['box']).reshape(2,2),axis=0)

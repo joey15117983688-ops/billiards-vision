@@ -1,4 +1,8 @@
 """JSON-line worker: local YOLO inference outside the Qt application's process."""
+# 独立模型进程：stdout 只输出一行一条 JSON，普通模型日志需转到 stderr。
+# 只加载已有权重执行 CPU 推理；从 NPY 读取原始帧，并按请求模式选择整桌或局部目标。
+# 图像坐标不使用 Qt 的缩放/旋转坐标；临时文件由主进程在请求结束时清理。
+
 from contextlib import redirect_stdout
 import json
 import cv2
@@ -16,10 +20,12 @@ from src.ball_tracks import appearance,BallTracks
 from src.table_geometry import prediction_detections, contains_point
 
 
+# 写一行 JSON 并立即 flush，保证主进程的 readline 能读到完整协议消息。
 def reply(value):
     print(json.dumps(value), flush=True)
 
 
+# 围绕所选目标做局部推理/像素复核，结果还原到完整原图，保留 selection_id 供关联。
 def detect_selected(model,frame,target,calibration_polygon=None,scope_polygon=None):
     if target['name']=='billiards_table':
         from src.vision.pocket import TableDetector
@@ -67,6 +73,7 @@ def detect_selected(model,frame,target,calibration_polygon=None,scope_polygon=No
     return [min(ranked,key=lambda pair:pair[0])[1]] if ranked else []
 
 
+# 初始化现有权重后握手 ready，再循环处理 stdin 请求；单请求异常转为 error 响应，避免污染协议。
 def main():
     try:
         model_path = ROOT / "models" / "billiards_v1.pt"

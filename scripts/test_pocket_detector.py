@@ -1,4 +1,6 @@
 """Run one pocket localization on an image or a video frame and save diagnostic artifacts."""
+# 单帧袋口检测的命令行诊断；输入本地图片或指定视频时间点，调试产物不等于现场准确率。
+
 __test__ = False
 import argparse
 from datetime import datetime
@@ -15,6 +17,7 @@ from src.vision.pocket import PocketConfig, PocketDetector
 from src.vision.pocket.debug import save_debug_result
 
 
+# 读取指定原帧，运行已有 PocketDetector 并保存结构化结果与本地调试图；不更新用户持久化校准。
 def main():
     parser=argparse.ArgumentParser(description='独立检测球桌／袋口并保存 JSON 和调试图，不加载 YOLO')
     inputs=parser.add_mutually_exclusive_group()

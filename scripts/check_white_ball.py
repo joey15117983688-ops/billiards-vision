@@ -1,4 +1,6 @@
 """Check white-ball predictions against held-out boxes at the UI's confidence threshold."""
+# 白球验证入口：按 IoU 一对一匹配预测与验证框，不能用检测数量直接代替正确率。
+
 import argparse
 import json
 import os
@@ -13,6 +15,7 @@ os.environ.setdefault('YOLO_AUTOINSTALL', 'false')
 os.environ.setdefault('MPLBACKEND', 'Agg')
 
 
+# 计算两个矩形的交并比，空交集返回零，坐标单位沿用输入图像。
 def overlap(a, b):
     x1, y1 = max(a[0], b[0]), max(a[1], b[1])
     x2, y2 = min(a[2], b[2]), min(a[3], b[3])
@@ -21,6 +24,7 @@ def overlap(a, b):
     return intersection / union if union else 0
 
 
+# 加载已有权重，对验证图统计白球匹配/漏检/误检并保存本地报告，不修改标签或权重。
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=Path, required=True)

@@ -3,6 +3,10 @@
 A passed assessment only permits downstream analysis; actual pot evidence is
 still required. Defaults are provisional and must be tuned with venue samples.
 """
+# 实时源的预检信号，不是台球识别裁决；默认阈值待真实球房样本验证。
+# 区分 can_detect、can_measure 和 can_commit_event；恢复后的连续有效窗不能省略。
+# 当前未接入本地视频主链路，也不是第二阶段 B 尚待实现的完整局部光照许可。
+
 from dataclasses import dataclass
 import time
 import cv2
@@ -19,6 +23,7 @@ class ReadinessPolicy:
     max_mean_luma: float=235
     min_focus_variance: float | None=None
 
+    # 校验帧龄、最大观测间隔、恢复时间及亮度/清晰度阈值的基本范围。
     def __post_init__(self):
         if self.max_frame_age_ms<=0 or self.max_observation_gap<=0 or self.recovery_seconds<0:
             raise ValueError('画面时效／连续性参数无效')
@@ -42,10 +47,14 @@ class FrameReadiness:
 
 
 class LiveReadiness:
+    # 初始化前一帧包和稳定起点；新来源应建立新评估会话。
     def __init__(self,policy=None):
         self.policy=policy or ReadinessPolicy()
         self.previous=None;self.stable_since=None
 
+    # 用单调接收时间检查帧龄、顺序、掉帧、会话和分辨率变化。
+    # 在可选几何区域统计亮度/清晰度；画面可检测且几何就绪后仍要等待连续恢复窗才可提交事件。
+    # 许可只是允许下游分析，不会凭空生成轨迹或 POTTED；没有局部六袋质量细分。
     def assess(self,packet:StreamFrame,geometry_ready=False,polygon=None,now=None):
         now=time.monotonic() if now is None else now
         age=(now-packet.received_at)*1000

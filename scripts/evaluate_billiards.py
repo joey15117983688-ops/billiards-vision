@@ -1,4 +1,6 @@
 """Validate trained weights and inspect held-out demo frames; no label remapping."""
+# 已有模型离线评估工具，部署门槛与界面共享；验证集成绩不能外推成真实球房准确率。
+
 from pathlib import Path
 import argparse,json,os,sys
 
@@ -10,6 +12,7 @@ os.environ.setdefault('YOLO_AUTOINSTALL','false')
 os.environ.setdefault('YOLO_CONFIG_DIR',str(ROOT/'logs'/'ultralytics'))
 
 
+# 加载指定权重/数据划分，统计验证及原片抽样预测并写本地报告，不训练模型。
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--model',type=Path,required=True)

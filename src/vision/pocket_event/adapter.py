@@ -1,4 +1,8 @@
 """Convert raw detections (never flow predictions) and pocket pixels to one plane."""
+# 把原始检测、当前像素和袋口几何转换为事件状态机输入；适配器本身不解码视频或运行 YOLO。
+# 事件坐标：先映射到毫米平面，再除以物理短边，所有入口、球心和半径必须使用同一尺度。
+# 只在近期实测朝向袋口时尝试像素恢复；预测框仅用于搜索，不能直接成为入袋证据。
+
 import cv2
 import numpy as np
 from src.table_coordinates import TableCoordinates, TableDimensions
@@ -9,6 +13,8 @@ from . import BallObservation, EventConfig, PocketEventEngine, make_zones
 
 
 class PocketEventAdapter:
+    # 要求可靠台面几何，按图像长边匹配物理尺寸轴，构造六袋入口及独立身份关联器。
+    # estimated/missing 的几何可信度不会因为转换坐标而提升；内库外的袋心也不裁剪到边界。
     def __init__(self,pockets,dimensions=None,config=None,balls=('black_ball','white_ball'),track_target_balls=True):
         config=config or EventConfig()
         table=pockets['table']
@@ -46,6 +52,7 @@ class PocketEventAdapter:
         self.engine=PocketEventEngine(make_zones(converted,center,config),config,balls)
         if not self.engine.zones:raise ValueError('没有可用袋口，请先检测或手动校准')
 
+    # 相机变换更新像素参考和跟踪缓存，保留归一化事件历史；不因机位微调清空已确认计数。
     def align_geometry(self,pockets,delta):
         """Move pixel geometry, preserving normalized event history and verdicts."""
         from src.camera_alignment import map_points
@@ -67,10 +74,14 @@ class PocketEventAdapter:
             points=np.asarray(map_points([[x1,y1],[x2,y1],[x2,y2],[x1,y2]],delta))
             target['box']=[*points.min(axis=0),*points.max(axis=0)]
 
+    # 把原图点映射到事件平面；允许袋口位于内库外，不能用台内坐标接口把它裁掉。
     def project(self,points):
         # Pocket entrances can be outside the cloth; do not clip to the table.
         return cv2.perspectiveTransform(np.float32([points]),self.coordinates.image_to_mm)[0]/self.scale
 
+    # 将同类彩球先关联成独立身份，避免多个红球共用一个事件状态。
+    # 只为近期、连续且有朝向证据的袋口候选尝试像素/模板补观察；存在遮挡或离开连续窗口时停止恢复。
+    # target_names 和 engine.states 的历史身份尚未全部回收，这是基线已记录的增长风险，不在注释轮次修复。
     def track_targets(self,timestamp,detections,frame):
         # The model shares one class for every coloured ball. Associate real
         # detections before the engine groups them, so two reds stay independent.
@@ -149,6 +160,7 @@ class PocketEventAdapter:
             output.append({**item,'name':key})
         return output
 
+    # 在当前袋口邻域匹配此前实测球的外观模板；只有匹配与入口方向约束通过才返回候选。
     def pocket_template(self,frame,target,timestamp):
         identity=target['track_id'];template=self.target_templates.get(identity)
         if template is None:return None
@@ -165,6 +177,7 @@ class PocketEventAdapter:
         x,y=location
         return {**target,'box':[ax+x,ay+y,ax+x+w,ay+y+h],'confidence':.75,'method':'pocket_template_pixels'}
 
+    # 在可信袋口邻域寻找与该球相符的像素，返回的是当前画面的测量框而非运动外推。
     def pocket_pixels(self,frame,target):
         # Saturated coloured balls remain separable from white pocket liners
         # even when the general object detector drops its box at the cushion.
@@ -190,6 +203,7 @@ class PocketEventAdapter:
             found.append((np.linalg.norm(center-[cx,cy]),{**target,'box':[ax+x,ay+y,ax+x+w,ay+y+h],'confidence':.75,'method':'pocket_colour_pixels'}))
         return min(found,key=lambda pair:pair[0])[1] if found else None
 
+    # 将带身份的检测框转成统一尺度球心/半径，同时保留其它身份位置供歧义检查。
     def observations(self,detections):
         observed=[];all_positions=[];alternatives=[]
         for d in detections:
@@ -203,6 +217,8 @@ class PocketEventAdapter:
             else:alternatives.append(observation.center)
         return observed,all_positions,alternatives
 
+    # 检查台面主色偏离和袋口附近肤色遮挡，并更新 occluded_pockets。
+    # 这是保守启发式，不是人体模型或光照质量分类；彩灯下 clear=True 不代表画质可靠。
     def clear_scene(self,frame,detections):
         self.occluded_pockets=set()
         if frame is None:return False
@@ -242,6 +258,8 @@ class PocketEventAdapter:
         # Conservative obstruction gate, not an arm/person classifier.
         return not self.occluded_pockets and float(np.mean(blocked))<.025
 
+    # 先关联实测目标，再计算连续观测的运动/稳定性，最后把场景与局部袋口可见性送入状态机。
+    # 只有显式传入 scene_clear 时才使用调用方覆盖值；默认从原图计算，不把预测直接充当稳定证据。
     def update(self,timestamp,detections,frame=None,scene_clear=None):
         tracked=self.track_targets(timestamp,detections,frame)
         observations,positions,alternatives=self.observations(tracked)

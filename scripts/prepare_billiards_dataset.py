@@ -1,4 +1,7 @@
 """Convert audited LabelMe boxes and add reviewed table/demo-video labels."""
+# 已有离线数据准备工具，必须显式运行才构造训练目录；本轮不会执行。
+# 保持原训练/验证划分；自动派生目标或历史人工标注的来源不能混淆。
+
 from pathlib import Path
 import argparse
 import json
@@ -11,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DATASET = ROOT / 'data' / 'dataset'
 
 
+# 从当前图像估计台面外接范围，用于数据转换而非线上校准。
 def table_box(image):
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, np.array([30, 35, 25]), np.array([95, 255, 255]))
@@ -22,6 +26,7 @@ def table_box(image):
     return [x, y, x+w, y+h]
 
 
+# 为历史演示素材提取球体候选，不视为独立人类标注或新场景准确率。
 def demo_balls(image):
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     masks = [cv2.inRange(hsv, np.array([0, 100, 80]), np.array([12, 255, 255])) |
@@ -59,6 +64,7 @@ def demo_balls(image):
     return boxes
 
 
+# 保存样本图与 YOLO 标签，并根据原始划分写到对应目录。
 def write_sample(stem, image_path, boxes, split):
     image=cv2.imread(str(image_path)); height,width=image.shape[:2]
     target=DATASET/'images'/split/(stem+'.jpg')
@@ -72,6 +78,7 @@ def write_sample(stem, image_path, boxes, split):
     target.write_text('\n'.join(labels)+'\n')
 
 
+# 组织已存在来源的数据转换和可选白球类别；准备数据不自动启动训练。
 def main():
     global DATASET
     parser = argparse.ArgumentParser()

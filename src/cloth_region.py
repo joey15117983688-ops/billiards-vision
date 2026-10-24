@@ -1,10 +1,15 @@
 """Recover the whole connected cloth colour, including matching cushion bands."""
+# 从校准种子恢复相连台呢和同色库边，用于识别范围；不改变内库物理坐标定义。
+# 当前仍依赖全局主色和连通性，局部彩灯可能改变结果；不要将此代码注释理解为抗光已完成。
+
 import cv2
 import numpy as np
 from src.table_coordinates import TableCoordinates
 from src.vision.pocket.table_detector import _line,_intersection
 
 
+# 缩小图像后从种子内部估计主色，寻找与种子相连的颜色区域，再拟合外沿。
+# 返回范围多边形和证据；证据不足返回 None，由调用方保留原范围而非接受任意轮廓。
 def cloth_region(frame,seed_polygon):
     scale=min(1.,1200/max(frame.shape[:2]))
     image=cv2.resize(frame,None,fx=scale,fy=scale) if scale<1 else frame
@@ -79,6 +84,7 @@ def cloth_region(frame,seed_polygon):
     return None
 
 
+# 比较新旧范围与指定台呢颜色的一致性；只有明确增加合理连通范围时接受修正。
 def scope_improvement(frame,old,new,hue):
     """Require measurable evidence before changing an explicitly saved scope."""
     scale=min(1.,1200/max(frame.shape[:2]))

@@ -1,4 +1,7 @@
 """Replay a complete recording through the same engine used by the desktop UI."""
+# 离线进球诊断入口，串行读取本地帧并运行现有观察/事件模块，不改变 GUI 主循环。
+# 输出事件是算法判定，仍需原图证据复核；本地结果可能含私人视频信息。
+
 import argparse
 import json
 from pathlib import Path
@@ -11,6 +14,7 @@ from src.vision.pocket import PocketDetector
 from src.vision.pocket_event.adapter import PocketEventAdapter
 
 
+# 打开指定来源，建立几何和观测链路，按帧时间推进事件状态并保存诊断结果。
 def run(video,output,pockets=None,detections=None,black_only=False,hz=10):
     capture=cv2.VideoCapture(str(video));runner=None
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
@@ -60,6 +64,7 @@ def run(video,output,pockets=None,detections=None,black_only=False,hz=10):
         if runner:runner.shutdown()
 
 
+# 解析离线来源与输出参数，显式调用 run，不默认启动真实摄像头或训练。
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--video',type=Path,required=True)

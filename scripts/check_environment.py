@@ -1,4 +1,6 @@
 """Print environment versions and enforce the fixed compatibility requirements."""
+# 环境自检入口；记录已安装版本及运行条件，不自动升级依赖。
+
 import os
 import platform
 import sys
@@ -11,6 +13,7 @@ os.environ.setdefault("YOLO_CONFIG_DIR", str(config_dir))
 os.environ.setdefault("YOLO_AUTOINSTALL", "false")
 
 
+# 检查现有运行环境并输出诊断，导入成功不等价视觉算法或跨平台已验收。
 def main():
     import cv2
     import numpy

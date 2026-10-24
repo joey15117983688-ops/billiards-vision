@@ -1,4 +1,8 @@
 """Motion/appearance association and bounded trails, independent of YOLO classes."""
+# 跨帧身份关联：输入为原图像素框，外观在裁剪球心区域统计；距离使用像素/球径归一化。
+# 匈牙利匹配解决整批一对一关联；无法可靠消歧时宁可丢失身份，不强行接到所选球。
+# 轨迹有界并显式记录 gap；身份历史不是进球状态机的真实入口证据。
+
 from collections import deque
 import cv2
 import numpy as np
@@ -6,9 +10,11 @@ from scipy.optimize import linear_sum_assignment
 from .ball_observation import BALL_NAMES
 
 
+# 由检测框两端计算像素中心，统一后续距离计算的输入格式。
 def center(item):return np.mean(np.array(item['box'],float).reshape(2,2),axis=0)
 
 
+# 只统计球心圆形区域的 HSV 直方图，降低矩形角落台呢对外观的影响。
 def appearance(frame,item):
     x1,y1,x2,y2=np.rint(item['box']).astype(int)
     cx,cy=(x1+x2)/2,(y1+y2)/2
@@ -24,15 +30,19 @@ def appearance(frame,item):
 
 
 class BallTracks:
+    # 设置每球路径容量和最大失踪帧龄；显示编号与内部身份 ID 分开递增。
     def __init__(self,max_points=600,max_age=60):
         self.states={};self.next_id=1;self.max_points=max_points;self.max_age=max_age
         self.retired=set();self.next_label=1
 
+    # 用巴氏距离比较归一化外观直方图；缺少外观时返回中性值而非虚构差异。
     @staticmethod
     def distance(a,b):
         if a is None or b is None:return 0.
         return float(cv2.compareHist(a.astype(np.float32),b.astype(np.float32),cv2.HISTCMP_BHATTACHARYYA))
 
+    # 先合并重复局部观测，再以运动预测、外观和选择提示构建匹配代价矩阵。
+    # 匹配后只向路径加入实际位置；失踪/跳帧保留断点，过期身份回收，活动身份最多 128 个。
     def update(self,frame_id,frame,items,appearance_scale=1.):
         balls=[dict(d) for d in items if d['name'] in BALL_NAMES]
         # Suppress duplicate local-crop reports of the same physical object.
@@ -54,6 +64,7 @@ class BallTracks:
                 if distance>size*((6 if observed_hint else 2)+min(dt,15)*.5):continue
                 if colour>.65 and not (item.get("_pocket_continuity") and hint==key):continue
                 costs[i,j]=distance/size+.9*colour
+        # 全局一对一匹配后还需检查近似等价候选，避免交汇时随意交换身份。
         matches={}
         if costs.size:
             rows,cols=linear_sum_assignment(costs)
@@ -81,6 +92,7 @@ class BallTracks:
             state=self.states[key];position=center(item);dt=frame_id-state['frame']
             if dt>0:
                 state['velocity']=.65*((position-state['center'])/dt)+.35*state['velocity']
+            # gap 标记让绘制端断开缺失区间，不把丢失时段的预测当真实路径。
             gap=dt>1 or state['status']=='lost'
             if not state['path'] or np.linalg.norm(position-np.array(state['path'][-1][:2]))>=1 or gap:
                 state['path'].append((float(position[0]),float(position[1]),gap))
@@ -98,4 +110,5 @@ class BallTracks:
         if len(self.retired)>512:self.retired=set(sorted(self.retired)[-512:])
         return [dict(d) for d in items if d['name']=='billiards_table']+output
 
+    # 返回路径列表副本，调用方绘制时不直接修改内部 deque。
     def paths(self):return {key:list(state['path']) for key,state in self.states.items()}

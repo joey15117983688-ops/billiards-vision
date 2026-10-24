@@ -1,12 +1,20 @@
 """Conservative local cavity verification, constrained by the inner cushion geometry."""
+# 在透视展开图的几何候选附近，分别验证暗袋腔或明亮袋网/袋衬。
+# 暗色斑必须满足接近库口、接触台呢等结构证据，不能把台内黑球当袋口。
+# 入口走廊与可见袋腔中心分开：轨迹需要穿过过渡区，不要求球心正好经过袋腔质心。
+
 import cv2
 import numpy as np
 from .models import PocketResult
 
 
 class PocketValidator:
+    # 保存局部搜索尺度与启发式门槛；评分不视为经过统计校准的概率。
     def __init__(self, config):self.config=config
 
+    # 默认 estimated；有效像素太少时 missing，缺少台呢上下文时保留估算。
+    # 暗腔候选检查暗阈值、库外占比、对比度与形状；袋网候选还检查纹理及口部相交。
+    # 只有局部证据达标才 observed，再把中心与入口从展开图映射回原图，供显示和事件判断。
     def validate(self, pocket_id, normalized, geometry, warped, valid):
         c=self.config
         point=np.array(normalized,float)*[c.canonical_width,c.canonical_height]+c.padding
@@ -130,6 +138,7 @@ class PocketValidator:
                 'outside_cloth_fraction':outside_fraction,'cloth_contact_pixels':contact,
                 'texture_gray_std':texture,'partial_visibility':bool(np.any((cv2.dilate(component,np.ones((5,5),np.uint8))>0)&(support==0))),
                 'visible_search_fraction':float(np.mean(support>0))}))
+        # 只在暗腔/袋网的局部结构证据通过时把 estimated 升级为 observed。
         if candidates:
             score,center,area,quality=max(candidates,key=lambda item:item[0])
             result.status='observed';result.center=geometry.canonical_to_image([center])[0].tolist()

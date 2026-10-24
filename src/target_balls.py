@@ -1,10 +1,14 @@
 """Locate one black and one white ball inside the visible playing surface."""
+# 台面与球体候选融合：模型候选结合黑白球像素补充，再过滤桌外目标。
+# 使用 playable_polygon 约束物理比赛区域，scope_polygon 可用于更宽的显示范围。
+
 import cv2
 import numpy as np
 from src.vision.pocket import TableDetector
 from src.ball_observation import closest_ball
 
 
+# 取可用台面比赛多边形，兼容仅有显示 polygon 的历史检测结构。
 def playing_surface(frame):
     table = TableDetector().detect(frame)
     if not table.detected or not table.quality.get('geometry_reliable'):
@@ -12,6 +16,7 @@ def playing_surface(frame):
     return table.playable_polygon
 
 
+# 按台面多边形构造图像掩模，供局部球体像素搜索排除桌外背景。
 def surface_mask(frame, polygon):
     mask = np.zeros(frame.shape[:2], np.uint8)
     if polygon:
@@ -19,6 +24,7 @@ def surface_mask(frame, polygon):
     return mask
 
 
+# 利用颜色、亮度及轮廓寻找黑白球候选，并与模型球框关联；分数只是规则质量评分。
 def target_balls(frame, detections=(), polygon=None):
     polygon = playing_surface(frame) if polygon is None else polygon
     if not polygon:
@@ -72,6 +78,7 @@ def target_balls(frame, detections=(), polygon=None):
     return [max(items,key=lambda item:item['confidence']) for items in candidates.values() if items]
 
 
+# 统一台面检测、已有校准及球体候选，按台面过滤并去重，保持显示与坐标使用相容几何。
 def scene_detections(frame, detections, calibration_polygon=None, scope_polygon=None):
     """Keep the table and all on-table balls, refining only black/white labels."""
     if calibration_polygon is not None:

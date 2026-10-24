@@ -3,6 +3,10 @@
 Timestamps measure local decode receipt, not camera-to-screen latency. No events
 or calibration updates happen here. The capture is owned by one reader thread.
 """
+# 实时源前期独立模块，尚未接入主窗口，不把本地 MP4 处理称为真实设备联调。
+# 使用后台读取与单槽最新帧缓存，消费慢时丢弃中间帧，不积压完整录像。
+# 连续性使用 session/sequence/单调接收时间判断；网络地址可能含凭据，不应公开运行配置。
+
 from dataclasses import dataclass,field
 from enum import Enum
 import hashlib
@@ -30,12 +34,14 @@ class LiveSourceConfig:
     reconnect_initial: float=.5
     reconnect_max: float=5.
 
+    # 检查地址、稳定 camera_id、超时和重连参数，非法配置在拉流前失败。
     def __post_init__(self):
         if not self.camera_id.strip() or len(self.camera_id)>160:raise ValueError('需要稳定的球房／球桌／摄像机标识')
         if not self.source:raise ValueError('视频流地址不能为空')
         if min(self.open_timeout_ms,self.read_timeout_ms,self.max_frame_age_ms)<=0:raise ValueError('超时必须大于零')
         if not 0<self.reconnect_initial<=self.reconnect_max:raise ValueError('重连间隔无效')
 
+    # 以稳定来源标识生成配置键，避免临时连接状态影响校准归属。
     @property
     def calibration_key(self):
         # Tokens/passwords/hostnames may change; camera identity must not.
@@ -53,19 +59,23 @@ class StreamFrame:
 
 class LatestFrameBuffer:
     """At most one pending frame; a frame is delivered at most once."""
+    # 建立受锁保护的单帧槽，统计覆盖/消费情况，不创建无限队列。
     def __init__(self):
         self.condition=threading.Condition();self.pending=None
         self.received=0;self.delivered=0;self.overwritten=0;self.stale=0
 
+    # 新帧覆盖旧的未消费帧并更新统计，延迟优先于保留每个历史画面。
     def put(self,packet):
         with self.condition:
             self.received+=1
             if self.pending is not None:self.overwritten+=1
             self.pending=packet;self.condition.notify_all()
 
+    # 清空最新帧槽，换会话时不把旧帧递交给下游。
     def clear(self):
         with self.condition:self.pending=None;self.condition.notify_all()
 
+    # 原子取出并清空待消费帧；超过 max_age_ms 的旧帧丢弃，等待最多 timeout 秒。
     def take(self,max_age_ms=500,timeout=0):
         deadline=time.monotonic()+max(0,timeout)
         with self.condition:
@@ -78,12 +88,14 @@ class LatestFrameBuffer:
                 self.stale+=1;return None
             self.delivered+=1;return packet
 
+    # 受锁读取缓冲统计，用于诊断生产/消费速率及覆盖情况。
     def snapshot(self):
         with self.condition:
             return dict(received=self.received,delivered=self.delivered,overwritten=self.overwritten,
                         stale=self.stale,pending=int(self.pending is not None))
 
 
+# 为网络地址设置 OpenCV 后端与打开/读取超时，不能套用于所有设备 SDK。
 def open_network_capture(config):
     if urlsplit(config.source).scheme.lower() not in ('rtsp','rtsps','http','https'):
         raise ValueError('仅接受 RTSP／HTTP 视频流地址')
@@ -97,6 +109,7 @@ def open_network_capture(config):
 
 
 class LatestFrameStream:
+    # 注入 capture 工厂与状态回调，便于使用本地回放进行无硬件测试。
     def __init__(self,config,capture_factory=open_network_capture):
         self.config=config;self.capture_factory=capture_factory
         self.buffer=LatestFrameBuffer();self.stop_event=threading.Event()
@@ -104,15 +117,19 @@ class LatestFrameStream:
         self.state=StreamState.STOPPED;self.session=0;self.sequence=0
         self.reconnections=0;self.last_error=None
 
+    # 统一发布连接/运行/重试状态；只通知，不在回调里做视觉分析。
     def _state(self,state,error=None):
         with self.lock:self.state=state;self.last_error=error
 
+    # 启动独立读取线程；已在运行时不重复创建生产者。
     def start(self):
         if self.thread is not None and self.thread.is_alive():return
         self.stop_event.clear();self.buffer.clear()
         self.thread=threading.Thread(target=self._run,name='latest-live-frame',daemon=True)
         self.thread.start()
 
+    # 循环打开、读取和发布最新帧，失败时清理 capture 并按配置等待重连。
+    # 每次新连接使用新会话标识，恢复帧不能被当作前一段连续观测直接确认事件。
     def _run(self):
         delay=self.config.reconnect_initial
         try:
@@ -150,9 +167,11 @@ class LatestFrameStream:
         finally:
             self.buffer.clear();self._state(StreamState.STOPPED)
 
+    # 向消费者提供最新帧，分析线程无需参与网络读取或重连。
     def read_latest(self,timeout=0):
         return self.buffer.take(self.config.max_frame_age_ms,timeout)
 
+    # 汇总流状态和缓存统计，不把连接成功当作识别质量达标。
     def snapshot(self):
         with self.lock:
             status=dict(camera_id=self.config.camera_id,calibration_key=self.config.calibration_key,
@@ -160,6 +179,7 @@ class LatestFrameStream:
                         last_error=self.last_error)
         return {**status,**self.buffer.snapshot()}
 
+    # 请求停止并回收读取资源；底层读取是否能及时退出还受后端超时支持影响。
     def stop(self,timeout=None):
         self.stop_event.set();self.buffer.clear()
         if self.thread is not None:

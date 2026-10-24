@@ -1,6 +1,8 @@
 """Generate complete synthetic shot videos and annotated inputs, then replay.
 These are logic regressions, NOT measurements of real-camera/YOLO accuracy.
 """
+# 进球模块的受控验证工具；合成轨迹/已有素材分别用于规则回归，不宣称现场准确率。
+
 import argparse
 import json
 from pathlib import Path
@@ -15,6 +17,7 @@ CENTERS={'TOP_LEFT':(0,0),'TOP_MIDDLE':(1,0),'TOP_RIGHT':(2,0),
          'BOTTOM_LEFT':(0,1),'BOTTOM_MIDDLE':(1,1),'BOTTOM_RIGHT':(2,1)}
 
 
+# 生成完整合成视频及配套观测 JSONL，区分正常入袋、重新出现/遮挡等状态机条件。
 def generate(root,kind,pocket='TOP_RIGHT'):
     root.mkdir(parents=True,exist_ok=True)
     def pixels(point):return (np.asarray(point)*250+[70,70]).tolist()
@@ -54,6 +57,7 @@ def generate(root,kind,pocket='TOP_RIGHT'):
     return video
 
 
+# 组织验证场景并保存实际裁决，规则测试成功不等于新球房视频已验收。
 def main():
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--output',type=Path,default=ROOT/'data/pocket_events_validation')
     args=parser.parse_args();report=[]

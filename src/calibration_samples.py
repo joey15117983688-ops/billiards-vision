@@ -1,4 +1,7 @@
 """Archive exact human-labeled frames for future supervised geometry training."""
+# 已有人工标注样本的本地归档，不执行训练，也不把未标注的球体当作负样本。
+# 图像与标注摘要去重，临时目录准备完整后再发布，避免留下可被误读为完整的样本。
+
 import hashlib
 import json
 import shutil
@@ -9,6 +12,8 @@ import numpy as np
 from src.manual_calibration import manual_geometry
 
 
+# 先验证人工几何，再保存原帧、台面 mask 与归一化标注；明确 balls=unlabeled。
+# 内容已存在时复用；保存异常时清理临时目录，不上传图像或来源信息。
 def save_calibration_sample(root,frame,profile,source):
     polygon,pockets=manual_geometry(frame,profile)
     height,width=frame.shape[:2]

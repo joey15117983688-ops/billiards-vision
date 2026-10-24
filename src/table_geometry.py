@@ -1,8 +1,12 @@
 """Estimate the visible green table surface inside a YOLO table box (not an OBB model)."""
+# YOLO 框到可见台面四边形及常规检测字典的转换。
+# 轮廓不可靠时允许保留检测框；几何后处理不是新的分割模型。
+
 import cv2
 import numpy as np
 
 
+# 在指定框内寻找台呢凸四边形，按原图像素返回；候选需满足面积和可见结构约束。
 def table_polygon(frame, box):
     height, width = frame.shape[:2]
     x1, y1, x2, y2 = np.rint(box).astype(int)
@@ -48,6 +52,7 @@ def table_polygon(frame, box):
     return None
 
 
+# 把模型 boxes/classes 转成项目统一结构，对台面尝试多边形后处理并合并重复候选。
 def prediction_detections(prediction, frame):
     detections = []
     for box in prediction.boxes:
@@ -81,6 +86,7 @@ def prediction_detections(prediction, frame):
     return kept + [d for d in detections if d['name'] != 'billiards_table']
 
 
+# 有多边形时按多边形命中，否则回退矩形框，坐标均为原图像素。
 def contains_point(item, x, y):
     if item.get('polygon'):
         return cv2.pointPolygonTest(np.array(item['polygon'], np.float32), (float(x), float(y)), False) >= 0

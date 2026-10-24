@@ -1,4 +1,7 @@
 """Persist accepted automatic corrections separately from human ground truth."""
+# 自动校准记录、人工配置摘要及显式纠错反馈的持久化。
+# 保存使用同目录临时文件替换；归一化四角支持同纵横比分辨率恢复，人工摘要隔离不同基准。
+
 import hashlib
 from copy import deepcopy
 import json
@@ -10,10 +13,12 @@ import cv2
 from src.table_coordinates import TableCoordinates
 
 
+# 对排序后的人工配置 JSON 求摘要，防止自动记录被错误应用到另一个人工基准。
 def profile_digest(profile):
     return hashlib.sha256(json.dumps(profile,sort_keys=True).encode()).hexdigest()
 
 
+# 先写同目录临时文件再 replace，减少中途退出留下半个 JSON 的风险；不是磁盘 fsync 保证。
 def write_json(path,data):
     path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
     temporary=path.with_suffix(path.suffix+'.tmp')
@@ -21,6 +26,7 @@ def write_json(path,data):
     temporary.replace(path)
 
 
+# 仅显式纠错时记录本次否定边界和尝试次数，最多保留 12 个拒绝范围供搜索剔除。
 def begin_feedback(path,frame,previous,manual_profile):
     path=Path(path);scale=np.array([frame.shape[1],frame.shape[0]])
     digest=profile_digest(manual_profile)
@@ -49,6 +55,8 @@ def begin_feedback(path,frame,previous,manual_profile):
             'manual':manual_profile is not None}
 
 
+# 保存内库归一化坐标、袋口和固定参考图；内容相同时不重复刷新保存时间。
+# 真正更新前保留 previous 备份；保存的是接受的几何，不是人工标注真值。
 def save_automatic(path,frame,result,manual_profile):
     h,w=frame.shape[:2]
     pockets=deepcopy(result['pockets'])
@@ -72,6 +80,8 @@ def save_automatic(path,frame,result,manual_profile):
                      'pockets':pockets,'report':result['calibration_report']})
 
 
+# 验证版本、人工摘要、纵横比并按当前分辨率恢复四角/六袋及变换矩阵。
+# verify_scene 可做离线图像复核；显式固定机位恢复不应因开局有人遮挡就强行重检测。
 def _load_automatic(path,frame,manual_profile,verify_scene=True):
     path=Path(path)
     if not path.exists():return None
@@ -112,6 +122,7 @@ def _load_automatic(path,frame,manual_profile,verify_scene=True):
     return polygon,pockets
 
 
+# 把损坏、缺失或不兼容记录转成 None，由调用方提示/回退，不自动覆盖文件。
 def load_automatic(path,frame,manual_profile,verify_scene=True):
     try:return _load_automatic(path,frame,manual_profile,verify_scene)
     except (OSError,ValueError,KeyError,TypeError,IndexError,cv2.error):return None

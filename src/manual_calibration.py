@@ -1,4 +1,7 @@
 """Validate user-confirmed normalized geometry without claiming visual detection."""
+# 将用户确认的归一化四角/六袋转成当前原图几何。
+# manual 状态表示人工确认，不声称在当前像素中自动发现袋腔。
+
 from itertools import permutations
 import numpy as np
 from src.table_coordinates import TableCoordinates
@@ -6,6 +9,8 @@ from src.vision.pocket.models import TableResult, PocketResult, PocketDetectionR
 from src.vision.pocket.table_geometry import TableGeometry, CANDIDATES
 
 
+# 校验点数、有限性、画面范围和六袋间距，再把人工袋心对应到标准六袋身份。
+# 生成可供坐标/入口判断使用的几何结构，不改变输入原图或启动模型训练。
 def manual_geometry(frame,profile):
     corners=np.asarray(profile.get('corners'),float)
     centers=np.asarray(profile.get('pockets'),float)

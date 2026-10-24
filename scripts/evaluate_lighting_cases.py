@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Read-only lighting diagnostics on unchanged CV algorithms, not field accuracy."""
+# 对子任务 A 的固定输入运行原有 CV 算法，输出配对基线、逐帧 trace 和本地联系表。
+# 固定几何适配器与相机对齐分别诊断，不等价完整 UI 播放，也不实现后续 B 的保护许可。
+# 没有人类逐帧真值时 accuracy 保持空；球数/事件变化不能直接叫准确率提升或 FP/FN。
+
 import argparse
 from collections import Counter
 from copy import deepcopy
@@ -22,6 +26,7 @@ from src.vision.pocket_event.adapter import PocketEventAdapter
 from src.vision.pocket_event.pixel_observer import PixelBallObserver
 
 
+# 在循环起点和顺逆序之间取最小最大角点差，排除轮廓排序变化；缺少四角时不返回假零。
 def corner_difference(first, second):
     if len(first) != 4 or len(second) != 4:
         return None
@@ -31,11 +36,13 @@ def corner_difference(first, second):
                      for c in (b, b[::-1]) for i in range(4)))
 
 
+# 汇总离线局部耗时或位移的中位/P95/最大值，不能当成 UI 整机 FPS。
 def stats(values):
     return {'median': float(np.median(values)), 'p95': float(np.percentile(values, 95)),
             'max': float(max(values))} if values else None
 
 
+# 后期片段复用旧 fixture，其他段取正常首帧算法几何；都不是新人工真值，不保存新校准。
 def reference_for(case, first):
     if case['calibration_reference']:
         ref = json.loads((ROOT / case['calibration_reference']).read_text())
@@ -44,6 +51,9 @@ def reference_for(case, first):
     return PocketDetector().detect(first).to_dict(), 'original_clip_first_frame_algorithm_output_not_manual_truth'
 
 
+# 核验生成视频哈希，每帧运行像素观察/适配器并输出证据；正常变体先建立配对参考。
+# 几何每秒采两个相位以避免只看到 2 Hz 闪烁同一亮度；逐帧球体/事件本身不降采样。
+# 记录输入和脚本版本，最后核验解码序列与 manifest，写出本地图片，不把图像加入公开代码。
 def evaluate(manifest_path, output):
     manifest_path, output = Path(manifest_path), Path(output)
     manifest = json.loads(manifest_path.read_text())

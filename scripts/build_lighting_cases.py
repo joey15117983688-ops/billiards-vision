@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Build deterministic lossless *test* clips. Never imported by production code."""
+# 第二阶段 A 的测试输入构建器，不进入生产逐帧链路；输入原片必须与模板 SHA256 一致。
+# 固定种子、光度参数和逐帧时间相位生成合成扰动，空间坐标不改变，不代表实拍彩灯准确率。
+# 所有视频仅写本地新目录，FFV1 无损编码后全帧回读校验；任何异常都不覆盖原片。
+
 import argparse
 import hashlib
 import json
@@ -13,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SPEC = ROOT / 'tests/fixtures/lighting/cases.json'
 
 
+# 分块计算文件摘要，避免把整段原视频一次读入内存。
 def sha256(path):
     digest = hashlib.sha256()
     with Path(path).open('rb') as stream:
@@ -21,16 +26,20 @@ def sha256(path):
     return digest.hexdigest()
 
 
+# 保存可复查参数/哈希；allow_nan=False 保证不产生非标准 JSON 数值。
 def write_json(path, value):
     Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + '\n')
 
 
+# 以片段帧号/FPS 确定首尾正常区与渐变，不依赖构建时的墙钟或运行快慢。
 def envelope(index, count, fps):
     """Unchanged first/last 0.5s, 0.25s ramps; relative clip time, not wall time."""
     t = index / fps
     return float(np.clip(min((t - .5) / .25, ((count - 1) / fps - .5 - t) / .25), 0, 1))
 
 
+# 只做通道增益、局部光斑、亮度和噪声等光度运算，输出同尺寸 BGR uint8 副本。
+# 噪声按 seed/index 独立生成，处理顺序不影响结果；高光裁切是真实信息损失，不能伪称仍可识别。
 def perturb(frame, profile, index, count, fps, seed):
     """Photometric operations only: BGR uint8 in/out, no coordinate remapping."""
     kind = profile['kind']
@@ -76,6 +85,8 @@ def perturb(frame, profile, index, count, fps, seed):
     return np.rint(np.clip(image + amount * (target - image), 0, 255)).astype(np.uint8)
 
 
+# 先核验所有原片，拒绝已存在输出目录，再逐段同时生成选定光照变体。
+# 每帧生成前后与编码回读后的 BGR 序列摘要必须相等；manifest 区分原片和 synthetic_illumination。
 def build(spec_path, output, root=ROOT):
     spec_path, output, root = Path(spec_path), Path(output), Path(root)
     spec = json.loads(spec_path.read_text())
@@ -164,6 +175,7 @@ def build(spec_path, output, root=ROOT):
     return manifest
 
 
+# 命令行入口只构建测试数据；显式给出 --evaluate 才继续原算法诊断，不训练或修改模型。
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--spec', type=Path, default=DEFAULT_SPEC)

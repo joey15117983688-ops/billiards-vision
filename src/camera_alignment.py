@@ -1,10 +1,15 @@
 """Bounded image registration; a saved calibration stays the immutable baseline."""
+# 参考图配准与几何重投影；基准坐标和当前显示坐标必须分开保存。
+# 先尝试固定参考光流，再用 ORB 回退；只有覆盖足够台面范围的匹配才可产生变换。
+# lost 只描述配准失败；本模块不负责进球许可，也不自动写入校准文件。
+
 from copy import deepcopy
 import base64
 import cv2
 import numpy as np
 
 
+# 将参考画面缩为最长边 720 的灰度 JPEG 再编码，减少持久化校准体积。
 def encode_reference(frame):
     scale=min(1.,720/max(frame.shape[:2]))
     gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
@@ -14,11 +19,14 @@ def encode_reference(frame):
     return base64.b64encode(data).decode('ascii')
 
 
+# 以 3×3 单应矩阵批量映射像素点；空点集保持空，不生成默认坐标。
 def map_points(points,matrix):
     if not len(points):return []
     return cv2.perspectiveTransform(np.float32([points]),np.asarray(matrix,float))[0].tolist()
 
 
+# 深拷贝袋口数据，统一变换内库、范围、入口和双向坐标矩阵。
+# 从固定基准投影，不对上一帧已变换结果反复累乘，也不修改调用方的基准对象。
 def transform_geometry(polygon,scope,pockets,matrix):
     """Reproject copies; never progressively transform the already moved result."""
     polygon=map_points(polygon,matrix);scope=map_points(scope,matrix)
@@ -41,6 +49,7 @@ def transform_geometry(polygon,scope,pockets,matrix):
 
 
 class CameraAlignment:
+    # 在台面边界带采集参考角点和 ORB 描述符，尽量避免把移动球当机位参照。
     def __init__(self,frame,scope,reference=None):
         self.shape=frame.shape[:2];self.scale=min(1.,720/max(self.shape))
         self.matrix=np.eye(3);self.tick=0;self.lost=False
@@ -64,10 +73,12 @@ class CameraAlignment:
         self.keys,self.descriptors=self.orb.detectAndCompute(gray,mask)
         self.points=cv2.goodFeaturesToTrack(gray,300,.015,6,mask=mask,blockSize=5)
 
+    # 按构造时的尺寸比例生成灰度帧，保证参考图和当前图具有相同配准尺度。
     def gray(self,frame):
         gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
         return cv2.resize(gray,(round(self.shape[1]*self.scale),round(self.shape[0]*self.scale)))
 
+    # 通过 RANSAC 拟合受限相似变换，并检查内点比例、四象限覆盖、尺度/角度和最大位移。
     def estimate(self,source,target):
         if len(source)<12:return None
         source=np.asarray(source,np.float32).reshape(-1,2);target=np.asarray(target,np.float32).reshape(-1,2)
@@ -88,6 +99,8 @@ class CameraAlignment:
         if np.max(np.linalg.norm(moved-self.scope,axis=1))>min(self.shape)*.25:return None
         return matrix
 
+    # 默认每四帧实际检查一次；光流采用前后向一致性验证，失败再匹配 ORB。
+    # 失败保留先前矩阵并设 lost；微小变化低于门槛时不发布新的几何，防止显示抖动。
     def update(self,frame,force=False):
         self.tick+=1
         if frame.shape[:2]!=self.shape:self.lost=True;return None

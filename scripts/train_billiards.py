@@ -1,4 +1,7 @@
 """CPU fine-tuning with conservative batches, memory checks and resumable snapshots."""
+# 已有显式训练入口，本轮只添加注释，不运行或更换权重。
+# CPU 小批次训练带内存采样、并发锁和完整优化器检查点；软件门槛不是操作系统硬性内存上限。
+
 import argparse
 import fcntl
 import json
@@ -12,6 +15,8 @@ os.environ.setdefault('YOLO_AUTOINSTALL', 'false')
 os.environ.setdefault('YOLO_CONFIG_DIR', str(ROOT / 'logs' / 'ultralytics'))
 
 
+# 校验新训练/续训输入，设置既有 CPU 与内存策略，再注册内存/检查点回调。
+# 完整 resume 与用 best.pt 发起新微调不同；已完成或无优化器的检查点不能冒充可续训状态。
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', choices=['cpu'], default='cpu')
@@ -45,6 +50,7 @@ def main():
     log = ROOT / 'logs' / (args.name + '_memory.jsonl')
     log.parent.mkdir(parents=True, exist_ok=True)
 
+    # 按训练回调采样进程 RSS 和系统可用内存，超出预算中断；无法覆盖所有瞬时算子峰值。
     def check_memory(trainer=None, record=False):
         nonlocal peak
         rss = process.memory_info().rss / 2**30
@@ -59,6 +65,7 @@ def main():
             raise RuntimeError(f'Memory budget reached: RSS={rss:.2f} GiB, available={available:.2f} GiB; '
                                'training stopped, resume from weights/resume_last.pt of the last completed epoch')
 
+    # 保留含优化器的续训状态，避免只留下被剥离训练状态的部署权重。
     def preserve_checkpoint(trainer):
         # Ultralytics strips optimizer/epoch from last.pt at completion; keep a resumable copy.
         dest = trainer.last.parent / 'resume_last.pt'

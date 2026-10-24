@@ -1,4 +1,6 @@
 """Chinese display names for billiards and legacy COCO detection classes."""
+# 项目类别到中文显示名的集中映射，兼容历史类别命名；不是球色自动分类器。
+
 COCO_LABELS_ZH = {
     "person": "人", "bicycle": "自行车", "car": "汽车", "motorcycle": "摩托车",
     "airplane": "飞机", "bus": "公交车", "train": "火车", "truck": "卡车",
@@ -26,6 +28,7 @@ COCO_LABELS_ZH = {
 }
 
 
+# 按类别名称优先、类别 ID 兜底返回标签，无法匹配时保留可读的原名称。
 def chinese_label(name):
     billiards = {"billiards_table": "台球桌", "billiard_ball": "台球", "white_ball": "白球", "black_ball": "黑球"}
     return billiards.get(name, COCO_LABELS_ZH.get(name, "未知类别"))

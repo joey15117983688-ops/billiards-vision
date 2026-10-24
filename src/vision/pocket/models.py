@@ -1,4 +1,7 @@
 """Typed results; confidence values are heuristic quality scores, not probabilities."""
+# 袋口检测的数据结构和配置；坐标序列化为原图像素，normalized 字段另行标识。
+# observed 代表局部图像支持，manual 代表人工确认，estimated 为几何推算，missing 为不可定位。
+
 from dataclasses import dataclass, field
 
 
@@ -16,6 +19,7 @@ class PocketConfig:
     long_axis: str = 'auto'
     observed_quality_threshold: float = .60
 
+    # 集中限制分辨率、长宽比、搜索半径、padding 和 HSV 范围，防止无效参数传入几何算法。
     def __post_init__(self):
         if not 320 <= self.max_side <= 2400:
             raise ValueError('max_side must be within 320..2400')
@@ -50,12 +54,14 @@ class TableResult:
     cloth_mask: object = field(default=None, repr=False)
     scope_polygon: list = field(default_factory=list)
 
+    # 只导出几何/质量/原因字段；不把用于调试的大图掩模写入公共结果。
     def to_dict(self):
         return {key: getattr(self, key) for key in (
             'detected', 'complete', 'corners', 'playable_polygon', 'scope_polygon', 'boundary_lines',
             'confidence', 'quality', 'reasons')}
 
 
+# 把可选二维点序列转成 x/y 字典，保留 None 以表达未定位。
 def _point(value):
     return None if value is None else {'x': float(value[0]), 'y': float(value[1])}
 
@@ -73,6 +79,7 @@ class PocketResult:
     quality: dict = field(default_factory=dict)
     reasons: list = field(default_factory=list)
 
+    # 序列化中心、候选、入口及其状态和理由，估算结果不隐去来源标记。
     def to_dict(self):
         return {'id':self.id,'status':self.status,'candidate_center':_point(self.candidate_center),
                 'normalized_candidate':_point(self.normalized_candidate), 'center':_point(self.center),
@@ -96,6 +103,7 @@ class PocketDetectionResult:
     source: dict = field(default_factory=dict)
     artifacts: dict = field(default_factory=dict)
 
+    # 打包同帧尺寸、台面、袋口、坐标矩阵与诊断信息，图像调试产物单独保存。
     def to_dict(self):
         return {'schema_version':1,'table_detected':self.table.detected,'coordinate_system':'image_pixels',
                 'normalized_reference':'playable inner-cushion plane; physical pocket centers may lie slightly outside [0,1]',

@@ -1,4 +1,7 @@
 """Download and verify the default overhead pool clip."""
+# 公开演示视频下载/验证工具；用户现场录像不会经此脚本上传或分发。
+# 按固定来源、大小、摘要和解码检查接受文件，流式下载避免整段视频占内存。
+
 import hashlib
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -12,6 +15,7 @@ EXPECTED_BYTES = 951516
 EXPECTED_SHA1 = '3fe9c16245b82fd987f237ba869d4838bf7137cd'
 
 
+# 分块求文件摘要，用于固定素材身份核验。
 def digest(path):
     checksum = hashlib.sha1()
     with path.open('rb') as source:
@@ -20,6 +24,7 @@ def digest(path):
     return checksum.hexdigest()
 
 
+# 核验体积/校验和及首中末帧能解码，不能仅因文件存在就认为下载完整。
 def validate(path):
     if path.stat().st_size != EXPECTED_BYTES or digest(path) != EXPECTED_SHA1:
         raise RuntimeError('Video size/checksum does not match the source')
@@ -37,6 +42,7 @@ def validate(path):
         capture.release()
 
 
+# 按已有下载策略获取公开演示片并验证；失败保留诊断，不将错误网页当作视频。
 def main():
     if OUTPUT.exists():
         validate(OUTPUT)

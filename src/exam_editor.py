@@ -1,4 +1,8 @@
 """Snapshot circle editor; marks live in normalized calibrated table coordinates."""
+# 已有考题圆圈编辑模块；本轮只添加解释性注释，不修改交互或数据格式。
+# 中心 u/v 归一化到校准毫米平面；diameter 按画面台面短边百分比定义，不是毫米直径。
+# 画布裁剪偏移、控件显示缩放和视频旋转由映射函数处理，数据不保存屏幕坐标。
+
 from copy import deepcopy
 import math
 import cv2
@@ -9,6 +13,7 @@ from PyQt5.QtWidgets import QWidget, QDialog, QVBoxLayout, QHBoxLayout, QPushBut
 from src.table_coordinates import TableCoordinates
 
 
+# 限制数量、u/v 和直径范围并拒绝非有限数值，读取旧配置时不静默接受损坏标注。
 def validate_marks(data):
     if not isinstance(data,list) or len(data)>200:raise ValueError('无效的考题标注')
     result=[]
@@ -20,6 +25,7 @@ def validate_marks(data):
     return result
 
 
+# 先把归一化中心映射回原图，再以图像短边定义圆半径；这是图像平面圆，不是物理等距圆。
 def circle_geometry(coordinates,mark):
     """Use an image-plane circle, matching the actual snapshot without stretching."""
     d=coordinates.dimensions
@@ -31,6 +37,7 @@ def circle_geometry(coordinates,mark):
     return center,points
 
 
+# 统一绘制已有圆圈和从 1 开始的序号；文字保持直立居中，不显示坐标数据。
 def draw_marks(painter,coordinates,marks,map_point,selected=-1):
     painter.save();painter.setRenderHint(QPainter.Antialiasing);painter.setBrush(Qt.NoBrush)
     font=painter.font();font.setPixelSize(16);font.setBold(True);painter.setFont(font)
@@ -57,6 +64,7 @@ class ExamCanvas(QWidget):
     changed=pyqtSignal(object)
     selected=pyqtSignal(int)
 
+    # 复制标注并截取台面外接矩形，保存裁剪 origin 以便与完整原帧互相转换。
     def __init__(self,frame,polygon,dimensions,marks,parent=None):
         super().__init__(parent)
         self.coordinates=TableCoordinates(polygon,dimensions)
@@ -69,25 +77,31 @@ class ExamCanvas(QWidget):
         rgb=cv2.cvtColor(np.ascontiguousarray(frame[y:y+h,x:x+w]),cv2.COLOR_BGR2RGB)
         self.image=QImage(rgb.data,w,h,rgb.strides[0],QImage.Format_RGB888).copy()
 
+    # 计算截图在编辑控件中的等比例显示区域，黑边不参与新建圆圈。
     def area(self):
         size=self.image.size();size.scale(self.size(),Qt.KeepAspectRatio)
         return QRectF((self.width()-size.width())/2,(self.height()-size.height())/2,size.width(),size.height())
 
+    # 把完整原图点扣除裁剪偏移，再映射到编辑画布。
     def mapped(self,x,y):
         r=self.area()
         return QPointF(r.x()+(x-self.origin[0])*r.width()/self.image.width(),r.y()+(y-self.origin[1])*r.height()/self.image.height())
 
+    # 将编辑屏幕位置反变换回完整原图像素，与视频叠加使用同一坐标基础。
     def raw(self,point):
         r=self.area()
         return (self.origin[0]+(point.x()-r.x())*self.image.width()/r.width(),self.origin[1]+(point.y()-r.y())*self.image.height()/r.height())
 
+    # 绘制截图及圆圈，使用共享 draw_marks 保持视频与编辑器样式一致。
     def paintEvent(self,event):
         p=QPainter(self);p.fillRect(self.rect(),Qt.black);p.drawImage(self.area(),self.image)
         draw_marks(p,self.coordinates,self.marks,self.mapped,self.selection)
 
+    # 发送标注深拷贝，避免接收方保存/绘制时改变当前拖动状态。
     def publish(self):
         self.update();self.changed.emit(deepcopy(self.marks))
 
+    # 从后绘制的圈优先命中；屏幕像素容差区分边缘缩放与圈内移动。
     def hit_circle(self,point):
         # Hit tolerances are in screen pixels, independent of crop/zoom scale.
         for i in reversed(range(len(self.marks))):
@@ -100,6 +114,7 @@ class ExamCanvas(QWidget):
             if distance<radius:return i,'move'
         return None
 
+    # 命中已有圈时保存拖动起点；未命中时仅在有效台面内创建新圈。
     def mousePressEvent(self,event):
         if event.button()!=Qt.LeftButton:return
         x,y=self.raw(event.localPos())
@@ -122,6 +137,7 @@ class ExamCanvas(QWidget):
         self.drag={'action':'create','center':[x,y],'mark':deepcopy(self.marks[-1]),'distance':0.}
         self.selected.emit(self.selection);self.publish()
 
+    # 基于按下时的原始标注计算移动或直径变化，避免累计屏幕误差；中心仍需在台面内。
     def mouseMoveEvent(self,event):
         if self.anchor is None or self.drag is None or not event.buttons() & Qt.LeftButton:
             hit=self.hit_circle(event.localPos())
@@ -154,6 +170,7 @@ class ExamCanvas(QWidget):
             self.marks[self.selection]=candidate
             self.selected.emit(self.selection);self.publish()
 
+    # 结束本次拖动并发布最后状态，不把临时拖动缓存写入标注格式。
     def mouseReleaseEvent(self,event):
         if event.button()==Qt.LeftButton:
             self.anchor=None;self.drag=None
@@ -164,6 +181,7 @@ class ExamCanvas(QWidget):
 class ExamDialog(QDialog):
     changed=pyqtSignal(object)
 
+    # 连接已有的新建、尺寸、删除和清空控件；对话框状态通过信号与视频同步。
     def __init__(self,frame,polygon,dimensions,marks,parent=None):
         super().__init__(parent)
         self.setWindowTitle('考题');self.resize(900,650)
@@ -180,20 +198,25 @@ class ExamDialog(QDialog):
         self.canvas.changed.connect(self.changed);self.canvas.selected.connect(self.select)
         self.size_input.valueChanged.connect(self.resize_circle)
 
+    # 退出当前选择以回到画圆状态，不自动生成一个新圈。
     def new_circle(self):
         self.canvas.selection=-1;self.canvas.anchor=None;self.canvas.drag=None;self.canvas.update()
 
+    # 同步选中序号与直径控件，阻断信号以避免仅切换选择就触发缩放。
     def select(self,index):
         self.size_input.blockSignals(True);self.size_input.setValue(self.canvas.marks[index]['diameter']);self.size_input.blockSignals(False)
 
+    # 将尺寸控件值写到当前圈并发布更新，无选择时仅改变下一圈默认大小。
     def resize_circle(self,value):
         self.canvas.diameter=value
         if self.canvas.selection>=0:
             self.canvas.marks[self.canvas.selection]['diameter']=value;self.canvas.publish()
 
+    # 删除当前选中的已有圈并刷新选择，序号由列表顺序重新绘制。
     def delete_selected(self):
         if self.canvas.selection>=0:
             self.canvas.marks.pop(self.canvas.selection);self.canvas.selection=-1;self.canvas.anchor=None;self.canvas.drag=None;self.canvas.publish()
 
+    # 清空当前标注列表并发布；是否保存由主窗口的既有配置流程决定。
     def clear(self):
         self.canvas.marks=[];self.canvas.selection=-1;self.canvas.anchor=None;self.canvas.drag=None;self.canvas.publish()

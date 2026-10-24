@@ -1,4 +1,9 @@
 """Play a local snooker match recording in the existing PyQt5 window."""
+# 桌面入口：主线程负责 Qt 事件与视频解码，耗时校准通过 QThread 执行，YOLO 通过独立进程执行。
+# 几何约定：playable_polygon 是内库比赛平面；recognition_polygon/scope_polygon 还可包含相连库边。
+# 异步结果必须核对 generation/token；换源、重播或切换模式后，旧请求不得更新当前画面。
+# 此文件只是协调现有观测与状态机；预测轨迹不应被理解为真实入袋证据。
+
 import argparse
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -30,6 +35,7 @@ if not DEFAULT_VIDEO.is_file():DEFAULT_VIDEO = ROOT / "data" / "overhead_pool.mp
 DEFAULT_IMAGES = ROOT / "data" / "dataset" / "images" / "train"
 
 
+# Qt 与模型子进程之间的通信桥；信号将结果交回 UI，不直接操作界面控件。
 class YoloWorker(QObject):
     geometry_ready = pyqtSignal(int, object)
     ready = pyqtSignal()
@@ -39,6 +45,7 @@ class YoloWorker(QObject):
     live_failed = pyqtSignal(int, str)
     failed = pyqtSignal(int, str)
 
+    # 保存子进程、日志句柄和当前几何；模型不会在构造时加载，由 load 信号显式触发。
     def __init__(self):
         super().__init__()
         self.process = None
@@ -46,6 +53,8 @@ class YoloWorker(QObject):
         self.calibration_polygon = None
         self.scope_polygon = None
 
+    # 读取一行 JSON 协议消息，EOF 或 error 字段转成调用方可显示的异常。
+    # 这里仍是阻塞 readline，并没有通信超时保护；注释不代表该风险已经修复。
     def read_reply(self):
         line = self.process.stdout.readline()
         if not line:
@@ -55,6 +64,8 @@ class YoloWorker(QObject):
             raise RuntimeError(reply["error"])
         return reply
 
+    # 先回收旧进程，再启动当前 Python 环境中的模型 worker，并等待 ready 握手。
+    # stderr 写本地诊断日志，stdout 专用于 JSON 协议，避免模型日志破坏解析。
     @pyqtSlot()
     def load(self):
         try:
@@ -74,6 +85,8 @@ class YoloWorker(QObject):
         except Exception as exc:
             self.failed.emit(-1, str(exc))
 
+    # 将当前帧存成禁用 pickle 的临时 NPY，再通过 JSON 发送文件位置与请求选项。
+    # 无论成功或异常都删除临时帧；返回值是 worker 的真实响应，不补造检测结果。
     def request_prediction(self, frame, options):
         path = None
         try:
@@ -87,6 +100,7 @@ class YoloWorker(QObject):
             if path is not None:
                 path.unlink(missing_ok=True)
 
+    # 对点击当时的原始图像执行点选请求；几何和检测结果都携带同一世代号返回。
     @pyqtSlot(object, float, float, int)
     def identify(self, frame, x, y, generation):
         try:
@@ -97,6 +111,7 @@ class YoloWorker(QObject):
         except Exception as exc:
             self.failed.emit(generation, str(exc))
 
+    # 静态整帧识别入口；全目标列表通过 all_result 返回，异常仍绑定该次请求世代。
     @pyqtSlot(object, int)
     def identify_all(self, frame, generation):
         try:
@@ -105,6 +120,8 @@ class YoloWorker(QObject):
         except Exception as exc:
             self.failed.emit(generation, str(exc))
 
+    # 根据载荷是否含 targets/target 切换多选局部、单选局部或整帧推理。
+    # token 交给主窗口核对，保证延迟响应不会串入新的选择或来源。
     @pyqtSlot(object, int)
     def identify_live(self, frame, token):
         try:
@@ -117,6 +134,8 @@ class YoloWorker(QObject):
         except Exception as exc:
             self.live_failed.emit(token,str(exc))
 
+    # 关闭时先 terminate，三秒内不退出再 kill，随后回收管道和日志句柄。
+    # 该等待上界只适用于这里的子进程退出步骤，不等于整个 UI 关闭流程有超时。
     def shutdown(self):
         if self.process is not None:
             if self.process.poll() is None:
@@ -135,10 +154,13 @@ class YoloWorker(QObject):
             self.log = None
 
 
+# 单帧袋口检测任务；与 YOLO 开关独立，输出几何状态而非进球事件。
 class PocketWorker(QObject):
     done = pyqtSignal(int, object)
     failed = pyqtSignal(int, str)
 
+    # 用传入的冻结帧检测台面和袋口；任务被中断时不保存或发布后续结果。
+    # 调试图片仅写本地 data/debug，完成信号带 generation 供主窗口忽略旧结果。
     @pyqtSlot(object, int, object)
     def detect(self, frame, generation, source):
         try:
@@ -158,11 +180,14 @@ class PocketWorker(QObject):
             self.failed.emit(generation, str(exc))
 
 
+# 显式校准任务：重新读取源帧、搜索几何并回传；不会逐帧自动覆盖保存基准。
 class CalibrationWorker(QObject):
     progress = pyqtSignal(int, str)
     done = pyqtSignal(int, object, object)
     failed = pyqtSignal(int, str)
 
+    # 按来源重新读取指定图片或视频帧，读取失败就报错，不以旧画面冒充新输入。
+    # 已有人工样本收集只在请求显式携带标注时执行；geometry_only 避免为校准额外运行球体模型。
     @pyqtSlot(object, int, object)
     def run(self, fallback, generation, source):
         try:
@@ -199,12 +224,14 @@ class CalibrationWorker(QObject):
             self.failed.emit(generation,str(exc))
 
 
+# 原图显示及叠加层；所有识别数据保留原始图像坐标，绘制/点选时才映射到控件坐标。
 class VideoCanvas(QWidget):
     fullscreen_requested = pyqtSignal()
     pockets_available = pyqtSignal(bool)
     element_clicked = pyqtSignal(object, float, float)
     coordinate_hovered = pyqtSignal(str)
 
+    # 初始化独立的几何、选择、轨迹和袋口叠加状态；旋转仅影响显示，不修改原始帧。
     def __init__(self, parent=None):
         super().__init__(parent)
         self.rotate_portrait=False
@@ -237,6 +264,8 @@ class VideoCanvas(QWidget):
         self.setMinimumSize(320, 240)
         self.setAccessibleName("台球视频或样本图片，可开启 YOLO 后点击识别物体")
 
+    # 按 keep_pockets 决定是否保留袋口，清理旧选择并将 BGR 图像转为 Qt 图像。
+    # 视频连续播放时由调用方显式保留固定几何，不能把每次绘制当成重新校准。
     def set_frame(self, frame, keep_pockets=False):
         if not keep_pockets:
             self.pocket_result = None
@@ -252,6 +281,7 @@ class VideoCanvas(QWidget):
             self.calibrate_coordinates()
         self.update()
 
+    # 接受袋口结果并同步画布几何/坐标可用状态，通知界面更新相关按钮。
     def set_pocket_result(self, result):
         self.pocket_result = result
         self.pockets_available.emit(result is not None)
@@ -259,11 +289,13 @@ class VideoCanvas(QWidget):
             self.calibrate_coordinates()
         self.update()
 
+    # 清空袋口覆盖层并通知控件；与已经写入磁盘的校准配置分开管理。
     def clear_pockets(self):
         self.pocket_result = None
         self.pockets_available.emit(False)
         self.update()
 
+    # 删除当前高亮目标及球心读数，避免把上一帧的点选结果当作当前观测。
     def clear_selection(self):
         self.coordinate_ball = None
         self.selected_box = None
@@ -272,6 +304,7 @@ class VideoCanvas(QWidget):
         self.detections = []
         self.update()
 
+    # 保存一次点选目标的名称、框和可选多边形，供绘制及坐标读取使用。
     def set_selection(self, box, label, polygon=None):
         self.detections = []
         self.selected_box = box
@@ -279,6 +312,7 @@ class VideoCanvas(QWidget):
         self.selected_label = label
         self.update()
 
+    # 更新整组检测并尝试保留可匹配的选择；毫米球心取检测框中心，不取鼠标点。
     def set_detections(self, detections):
         self.clear_selection()
         self.detections = [dict(d) for d in detections]
@@ -297,26 +331,32 @@ class VideoCanvas(QWidget):
         if self.coordinate_mode:self.calibrate_coordinates()
         self.update()
 
+    # 将选中框转为控件绘制矩形；无选择时不产生虚构的矩形。
     def selected_rect(self):
         return self.box_rect(self.selected_box)
 
+    # 只有启用旋转且原图为竖向时才旋转，横向视频不再次旋转。
     def is_rotated(self):
         return self.rotate_portrait and not self.image.isNull() and self.image.height()>self.image.width()
 
+    # 窗口尺寸变化时重定位右上角旋转按钮，叠加坐标仍由当前显示矩形计算。
     def resizeEvent(self,event):
         super().resizeEvent(event)
         self.fullscreen_button.adjustSize()
         self.fullscreen_button.move(max(0,self.width()-self.fullscreen_button.width()-12),12)
         self.fullscreen_button.raise_()
 
+    # 返回旋转后的逻辑图像宽高，供等比例缩放使用。
     def display_dimensions(self):
         return (self.image.height(),self.image.width()) if self.is_rotated() else (self.image.width(),self.image.height())
 
+    # 将原始像素点映射到当前显示矩形；竖屏旋转与黑边偏移在此统一处理。
     def display_point(self,x,y):
         if self.is_rotated():x,y=self.image.height()-y,x
         width,height=self.display_dimensions();area=self.video_rect()
         return QPointF(area.left()+x*area.width()/max(1,width),area.top()+y*area.height()/max(1,height))
 
+    # display_point 的反向映射；点选必须用原图坐标提交给检测器。
     def image_point(self,point):
         area=self.video_rect()
         if self.image.isNull() or not area.contains(point) or area.isEmpty():return None
@@ -325,17 +365,20 @@ class VideoCanvas(QWidget):
         y=(point.y()-area.top())*height/area.height()
         return (y,self.image.height()-x) if self.is_rotated() else (x,y)
 
+    # 映射框的端点并规范化矩形，处理旋转后左右/上下端点次序变化。
     def box_rect(self, box):
         if box is None or self.image.isNull():return QRectF()
         x1,y1,x2,y2=box
         return self.canvas_polygon([[x1,y1],[x2,y1],[x2,y2],[x1,y2]]).boundingRect()
 
+    # 等比例适配图像并居中，黑边不属于视频内容或可点选台面。
     def video_rect(self):
         from PyQt5.QtCore import QSize
         width,height=self.display_dimensions()
         size=QSize(width,height).scaled(self.size(),Qt.KeepAspectRatio)
         return QRectF((self.width()-size.width())/2,(self.height()-size.height())/2,size.width(),size.height())
 
+    # 按已校准几何与现有检测选择可用台面；不是每次绘制都重新调用检测器。
     def table_outline(self):
         if self.calibration_polygon is not None:
             if self.recognition_polygon is not None:return self.recognition_polygon
@@ -351,6 +394,7 @@ class VideoCanvas(QWidget):
             return table.get('scope_polygon') or table.get('playable_polygon')
         return self.calibration_polygon
 
+    # 用可靠内库四边形建立毫米映射，边界或透视不可靠时返回失败。
     def calibrate_coordinates(self):
         self.coordinates = None
         self.coordinate_ball = None
@@ -371,6 +415,7 @@ class VideoCanvas(QWidget):
         if self.coordinate_mode:
             self.coordinate_hovered.emit("移动鼠标查看台面毫米坐标" if self.coordinates else "未可靠定位内库，暂不可换算坐标")
 
+    # 将悬停位置换算为原图/毫米坐标；黑边、台外或无可靠映射时不显示伪坐标。
     def mouseMoveEvent(self, event):
         if self.coordinate_mode:
             area=self.video_rect();point=event.localPos()
@@ -383,10 +428,12 @@ class VideoCanvas(QWidget):
             self.coordinate_hovered.emit(text)
         super().mouseMoveEvent(event)
 
+    # 鼠标移出画布时清理悬停读数，不改变已保存球桌尺寸或校准。
     def leaveEvent(self,event):
         if self.coordinate_mode:self.coordinate_hovered.emit("鼠标已离开画面")
         super().leaveEvent(event)
 
+    # 将毫米平面中的轴线与球心投影回显示区域；显示精度不等于物理测量精度。
     def draw_coordinates(self,painter):
         if not self.coordinate_mode or self.coordinates is None:return
         d=self.dimensions
@@ -410,6 +457,7 @@ class VideoCanvas(QWidget):
             painter.drawLine(lines[0],lines[1]);painter.drawLine(lines[1],lines[2])
             painter.drawEllipse(lines[1],6,6)
 
+    # 只处理有效视频区域内的点击，并把原图坐标通过信号交给主窗口。
     def mousePressEvent(self, event):
         if (event.button() == Qt.LeftButton and self.selection_enabled
                 and self.frame is not None and not self.image.isNull()):
@@ -420,6 +468,8 @@ class VideoCanvas(QWidget):
                 if image_point is not None:self.element_clicked.emit(self.frame.copy(), *image_point)
         super().mousePressEvent(event)
 
+    # 按原图、几何/袋口、检测/轨迹、坐标和既有标注顺序绘制。
+    # 这里不运行模型或更新进球计数，避免重绘频率改变识别语义。
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), Qt.black)
@@ -461,6 +511,7 @@ class VideoCanvas(QWidget):
                 painter.setPen(QPen(QColor('#40C4FF'),2))
                 painter.drawPolygon(self.canvas_polygon(scope))
 
+    # 绘制历史实测轨迹并尊重缺失区间的断点，避免跨越遮挡画出虚假的连续线。
     def draw_track_paths(self,painter):
         if not self.show_trails:return
         painter.setRenderHint(QPainter.Antialiasing);painter.setBrush(Qt.NoBrush)
@@ -474,6 +525,8 @@ class VideoCanvas(QWidget):
                 segment.append([x,y])
             if len(segment)>1:painter.drawPolyline(self.canvas_polygon(segment))
 
+    # 按 observed/manual/estimated/missing 的状态区别绘制入口和文字。
+    # 袋口可显示不等于它已被状态机视为可信入袋证据。
     def draw_pockets(self, painter):
         result = self.pocket_result
         if not result or not self.show_pocket_overlays:
@@ -531,9 +584,11 @@ class VideoCanvas(QWidget):
             label=min(choices,key=lambda box:sum(box.intersects(other) for other in occupied));occupied.append(label)
             painter.fillRect(label,Qt.black);painter.setPen(highlight);painter.drawText(label,Qt.AlignCenter,text)
 
+    # 将原图多边形各顶点映射为 Qt 多边形，复用与图像相同的旋转/缩放规则。
     def canvas_polygon(self, polygon):
         return QPolygonF([self.display_point(x,y) for x,y in polygon])
 
+    # 根据目标类型绘制球框或台面多边形，并布置文字及引线以减少重叠。
     def draw_detection(self, painter, box, text, color, font_size, occupied, polygon=None):
         shape = self.canvas_polygon(polygon) if polygon else None
         rect = shape.boundingRect() if shape is not None else self.box_rect(box)
@@ -575,6 +630,7 @@ class VideoCanvas(QWidget):
         painter.drawText(label, Qt.AlignCenter, text)
 
 
+# 主窗口持有播放、校准、选择、异步请求和事件会话；业务判定交给独立 src 模块。
 class MainWindow(QMainWindow):
     identify_requested = pyqtSignal(object, float, float, int)
     identify_all_requested = pyqtSignal(object, int)
@@ -583,6 +639,8 @@ class MainWindow(QMainWindow):
     calibration_requested = pyqtSignal(object, int, object)
     pocket_requested = pyqtSignal(object, int, object)
 
+    # 建立控件、计时器、会话容器及工作线程信号；加载默认配置但不自动开始播放。
+    # camera_geometry 保存固定基准副本，工作变换另存，防止反复变换造成累计漂移。
     def __init__(self, video_path=DEFAULT_VIDEO, image_dir=DEFAULT_IMAGES, start_with_images=False):
         super().__init__()
         self.setWindowTitle("台球视觉识别系统")
@@ -803,6 +861,7 @@ class MainWindow(QMainWindow):
         if self.calibration_presets.error:
             self.statusBar().showMessage("球桌配置列表无法读取，原文件已保留："+self.calibration_presets.error)
 
+    # 只旋转并适配当前视频区域，保留下方操作栏；没有调用系统全屏。
     def toggle_video_fullscreen(self):
         self.video_fullscreen=not self.video_fullscreen
         self.canvas.rotate_portrait=self.video_fullscreen
@@ -811,6 +870,8 @@ class MainWindow(QMainWindow):
         self.canvas.fullscreen_button.move(max(0,self.canvas.width()-self.canvas.fullscreen_button.width()-12),12)
         self.canvas.update()
 
+    # 以会话 epoch、shot_id、球身份为键覆盖判定；同事件重复返回不会重复加分。
+    # NOT_POTTED 修订会撤销该键先前的确认，因此不能简单对每个 POTTED 做累加。
     def update_pot_count(self,results=(),clear=False):
         if clear:self.pot_counts.clear()
         for result in results:
@@ -819,6 +880,7 @@ class MainWindow(QMainWindow):
                 self.pot_counts[key]=event['event']=='POTTED'
         self.pot_count_label.setText(f"（{sum(self.pot_counts.values())}）")
 
+    # 切换会话前把未完成杆以指定原因收尾为 UNKNOWN，关闭记录器并递增计数世代。
     def reset_pot_session(self,reason):
         if self.pot_adapter is not None and not self.pot_adapter.engine.completed and self.pot_adapter.engine.timestamp is not None:
             results=self.pot_adapter.engine.finish(force_unknown=reason)
@@ -831,6 +893,7 @@ class MainWindow(QMainWindow):
         self.pot_readout.setText("进球检测："+reason if self.pot_button.isChecked() else "进球检测未开启")
         self.pot_resume_after_calibration=False
 
+    # 开关进球观察并使旧 YOLO 请求失效；无袋口几何时先启动独立几何检测。
     def toggle_pot_detection(self,enabled):
         self.yolo_generation+=1
         self.reset_pot_session("等待当前视频画面")
@@ -848,6 +911,8 @@ class MainWindow(QMainWindow):
             return
         self.prepare_pot_detection()
 
+    # 用已有可信几何建立像素观察器、事件适配器和本地记录器。
+    # YOLO 只在轨迹/选择需要时开启；进球像素观察本身不等待模型结果。
     def prepare_pot_detection(self):
         if not self.pot_button.isChecked() or self.media_mode!="video":return
         if self.pot_adapter is None:
@@ -867,6 +932,7 @@ class MainWindow(QMainWindow):
         if (self.automatic_trails() or self.detection_mode!="idle") and not self.yolo_button.isChecked():self.yolo_button.setChecked(True)
         self.maybe_submit_live()
 
+    # 每个实际解码帧运行像素观察；时间取视频帧号/FPS，而非模型耗时或墙钟。
     def observe_current_pot_frame(self,frame):
         if not self.pot_button.isChecked():return
         if self.pot_observer is None or self.pot_adapter is None:self.prepare_pot_detection()
@@ -876,6 +942,8 @@ class MainWindow(QMainWindow):
         if fps>0:
             self.observe_pot_events(index/fps,self.pot_observer.observe(frame),frame)
 
+    # 将实测检测送入适配器，应用可修订计数并更新状态文字。
+    # 仅状态签名变化或新结果时写事件关键帧，避免每次 UI 刷新都存图。
     def observe_pot_events(self,timestamp,detections,frame):
         if self.pot_adapter is None:
             self.prepare_pot_detection()
@@ -907,14 +975,17 @@ class MainWindow(QMainWindow):
         except (ValueError,KeyError,cv2.error) as exc:
             self.pot_readout.setText(f"进球判定证据异常，需人工复核：{exc}")
 
+    # 前三种轨迹范围需要自动观测整桌；所选球和关闭轨迹走不同显示/提交规则。
     def automatic_trails(self):
         return self.trails_button.currentIndex()<3
 
+    # 只改变袋口叠加层可见性，不删除校准或停掉进球分析。
     def toggle_pocket_visibility(self, hidden):
         self.canvas.show_pocket_overlays=not hidden
         self.pocket_visibility_button.setText("显示袋口识别" if hidden else "隐藏袋口识别")
         self.canvas.update()
 
+    # 切换观察范围时递增请求世代并清理过时选择，必要时加载模型提交整桌请求。
     def toggle_trails(self, mode):
         self.canvas.show_trails=mode!=4
         self.yolo_generation+=1  # Results from a former selected-only request are obsolete.
@@ -934,6 +1005,8 @@ class MainWindow(QMainWindow):
             else:self.statusBar().showMessage("所选球轨迹：请先点击视频中的球，再播放")
         self.sync_tracks();self.canvas.update();self.update_all_button()
 
+    # 按全部/白球/其他球/所选球筛选显示轨迹，同时将身份位置流式写到本地记录。
+    # lost 状态不记录为真实球心；写盘失败只提示，不停止画面显示。
     def sync_tracks(self):
         identities=self.live_tracking.identities
         visible=set(self.selected_targets) if self.detection_mode=="single" and not self.automatic_trails() else set(identities.states)
@@ -959,12 +1032,14 @@ class MainWindow(QMainWindow):
             self.trails_button.setToolTip(f"轨迹显示继续；位置记录写入失败：{exc}")
         self.canvas.update()
 
+    # 更新参考尺寸按钮文字与提示，区分参考尺寸和用户测量尺寸。
     def refresh_dimension_label(self):
         d=self.canvas.dimensions
         prefix="参考" if d.reference else "配置"
         self.dimensions_button.setText(f"{prefix}尺寸：{d.x_mm:g} × {d.y_mm:g} mm")
         self.dimensions_button.setToolTip("内库之间的比赛区域尺寸；X 为上边方向，Y 为左边向下。点击修改并保存。")
 
+    # 校验并保存用户输入的 X/Y 毫米尺寸，然后刷新依赖该尺寸的坐标映射。
     def configure_dimensions(self):
         self.close_exam()
         dialog=QDialog(self);dialog.setWindowTitle("球桌比赛区域尺寸")
@@ -994,6 +1069,7 @@ class MainWindow(QMainWindow):
         if self.canvas.coordinate_mode:self.canvas.calibrate_coordinates()
         self.canvas.update()
 
+    # 打开已有截图编辑器并绑定当前几何；本轮只解释现有代码，不新增考题功能。
     def open_exam(self):
         if self.canvas.frame is None or self.canvas.calibration_polygon is None:
             self.statusBar().showMessage("请先自动或手动校准球桌，再打开考题")
@@ -1006,16 +1082,19 @@ class MainWindow(QMainWindow):
         self.exam_dialog.finished.connect(self.finish_exam)
         self.exam_dialog.show()
 
+    # 对话框结束时刷新已有标注并释放对话框引用。
     def finish_exam(self,*args):
         dialog=self.exam_dialog;self.exam_dialog=None
         if dialog is not None:dialog.deleteLater()
         self.flush_exam_marks()
 
+    # 接收标注副本，刷新视频叠加并通过单次计时器合并连续拖动产生的保存请求。
     def change_exam_marks(self,marks):
         self.canvas.exam_circles=deepcopy(marks);self.canvas.update()
         self.exam_pending=(self.calibration_profile_path().with_suffix('.exam.json'),deepcopy(marks))
         self.exam_save_timer.start(250)
 
+    # 将最后一次编辑结果写到对应配置；保存对象是标注，不是重新检测的台面。
     def flush_exam_marks(self):
         self.exam_save_timer.stop()
         if self.exam_pending is None:return
@@ -1026,6 +1105,7 @@ class MainWindow(QMainWindow):
             self.exam_pending=None
         except OSError as exc:self.statusBar().showMessage(f"考题标注保存失败：{exc}")
 
+    # 从当前球桌配置加载并校验标注；无效或缺失记录不伪造圆圈。
     def load_exam_marks(self):
         self.canvas.exam_circles=[]
         path=self.calibration_profile_path().with_suffix('.exam.json')
@@ -1039,10 +1119,12 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"考题标注读取失败：{exc}")
         self.canvas.update()
 
+    # 先关闭编辑器并处理已有保存流程，避免换源后旧编辑继续写入新配置。
     def close_exam(self):
         if self.exam_dialog is not None:self.exam_dialog.close()
         self.flush_exam_marks()
 
+    # 集中同步校准相关控件的可用性，防止异步校准期间重复提交。
     def calibration_controls(self, busy):
         self.calibration_busy=busy
         self.pocket_button.setText("球桌与袋口检测中…" if busy else "自动检测袋口")
@@ -1057,6 +1139,7 @@ class MainWindow(QMainWindow):
             self.update_navigation()
             self.update_all_button()
 
+    # 重建球房/球桌配置下拉框，并保留当前有效配置的选择。
     def refresh_calibration_presets(self):
         self.calibration_preset_combo.blockSignals(True)
         self.calibration_preset_combo.clear()
@@ -1069,12 +1152,14 @@ class MainWindow(QMainWindow):
         self.default_calibration_preset_button.setEnabled(self.active_calibration_preset!=default and not self.calibration_presets.error)
         self.add_calibration_preset_button.setEnabled(not self.calibration_presets.error)
 
+    # 询问用户配置名称，合法输入才进入创建流程。
     def add_calibration_preset(self):
         name,accepted=QInputDialog.getText(self,"新增球房／球桌配置","配置名称（例如：朝阳俱乐部 · 1号桌）")
         if not accepted:return
         try:self.create_calibration_preset(name)
         except (OSError,ValueError) as exc:self.statusBar().showMessage(f"配置保存失败：{exc}")
 
+    # 包装创建流程和错误提示，让创建失败保留原有配置。
     def create_calibration_preset(self,name):
         previous=deepcopy(self.calibration_presets.data)
         try:return self._create_calibration_preset(name)
@@ -1084,6 +1169,7 @@ class MainWindow(QMainWindow):
                 self.calibration_presets.save()
             raise
 
+    # 建立命名配置并复制当前可用校准/标注，避免仅创建一个空名字。
     def _create_calibration_preset(self,name):
         self.close_exam()
         from src.calibration_state import save_automatic,write_json
@@ -1104,6 +1190,7 @@ class MainWindow(QMainWindow):
         self.select_calibration_preset(self.calibration_preset_combo.currentIndex())
         return identity
 
+    # 显式保存启动默认配置；当前下拉选择与启动默认是两个不同状态。
     def set_default_calibration_preset(self):
         try:self.calibration_presets.set_default(self.active_calibration_preset)
         except (OSError,ValueError) as exc:
@@ -1111,6 +1198,7 @@ class MainWindow(QMainWindow):
         self.refresh_calibration_presets()
         self.statusBar().showMessage("已设为默认，下次打开直接使用该配置；后续校准会自动保存")
 
+    # 先清理旧会话再恢复所选配置，避免不同球房的坐标/事件相互混用。
     def select_calibration_preset(self,index):
         if self.calibration_busy:return
         self.pause_video()
@@ -1125,12 +1213,15 @@ class MainWindow(QMainWindow):
         name=self.calibration_preset_combo.currentText()
         self.statusBar().showMessage(f"已加载 {name}，点击播放即可使用" if restored else f"{name} 尚无适用校准，请先自动或手动校准一次")
 
+    # 命名配置使用其专属目录；未选配置时以来源路径哈希区分视频/图片。
     def calibration_profile_path(self):
         if self.active_calibration_preset:return self.calibration_presets.path(self.active_calibration_preset)
         source=(self.image_paths[self.image_index] if self.media_mode=='images' else self.video_path)
         key=hashlib.sha256(str(source.resolve()).encode('utf-8')).hexdigest()
         return ROOT/'config'/'calibration'/f'{key}.json'
 
+    # 复制固定几何并以参考画面建立配准器；旧版无参考记录仅在当前会话补锚点。
+    # 工作变换与磁盘基准分离，这个步骤不把局部遮挡下的新轮廓自动写回配置。
     def start_camera_alignment(self,reference=None,legacy=False):
         self.camera_alignment=None;self.camera_geometry=None
         self.camera_anchor=np.eye(3);self.camera_matrix=np.eye(3)
@@ -1160,6 +1251,8 @@ class MainWindow(QMainWindow):
             self.camera_alignment=None
             self.statusBar().showMessage(f'画面对齐暂不可用，保留已保存基准：{exc}')
 
+    # 把相对于参考图的变换应用到基准副本，并同步适配器、画布与模型范围。
+    # 失败保留显示几何；当前实现尚未把 lost 接入统一进球许可，不能据注释当作已安全保护。
     def update_camera_alignment(self,frame,force=False):
         if self.camera_alignment is None or self.camera_geometry is None:return
         from src.camera_alignment import transform_geometry
@@ -1185,6 +1278,7 @@ class MainWindow(QMainWindow):
         self.canvas.calibrate_coordinates()
         self.canvas.update()
 
+    # 读取保存时间/版本与当前对齐状态，用于显示基准来源和可信性提示。
     def refresh_calibration_state(self):
         path=self.calibration_profile_path().with_suffix('.auto.json')
         try:
@@ -1195,6 +1289,8 @@ class MainWindow(QMainWindow):
             self.calibration_state_label.setToolTip(f'已保存至 {path}\n播放、切换横竖屏、重启均沿用基准；镜头变化时只对齐显示，点击自动检测或手动校准才修改保存值。')
         except (OSError,ValueError,AttributeError):self.calibration_state_label.setText('校准：尚无已保存记录')
 
+    # 优先恢复已保存的自动/人工记录，按帧尺寸换算几何并启动参考配准。
+    # 恢复失败不意味着可以把当前遮挡画面保存成新的默认校准。
     def restore_saved_calibration(self):
         """Restore source geometry before any new inference can use the frame."""
         self._calibration_restore_note=None
@@ -1247,6 +1343,7 @@ class MainWindow(QMainWindow):
         self.canvas.update()
         return True
 
+    # 暂停后打开人工角点/袋口编辑器；仅用户接受并通过校验时保存结果。
     def edit_calibration(self):
         if self.calibration_busy or self.canvas.frame is None:return
         self.pause_video()
@@ -1269,6 +1366,7 @@ class MainWindow(QMainWindow):
             return
         self.calibrate_table(collect_sample=not dialog.clear_saved)
 
+    # 显式校准入口：保存纠错上下文、冻结当前任务来源并启动后台搜索。
     def calibrate_table(self, collect_sample=False):
         if self.calibration_busy:return
         if self.canvas.frame is None:
@@ -1326,10 +1424,13 @@ class MainWindow(QMainWindow):
             self.calibration_thread.start()
         self.calibration_requested.emit(frame,self.media_generation,source)
 
+    # 仅更新当前校准世代的进度提示，忽略换源前的旧消息。
     def on_calibration_progress(self,generation,message):
         if self.calibration_busy and generation==self.media_generation:
             self.statusBar().showMessage("校准中 · "+message)
 
+    # 核对世代后接受几何、恢复相关显示并按原流程保存；旧任务不得覆盖新来源。
+    # 自动纠错报告 unchanged 时保留旧几何语义，不把提示与实际保存结果混淆。
     def on_calibration_done(self,generation,frame,result):
         if generation!=self.media_generation:return
         report=result.get('calibration_report')
@@ -1401,6 +1502,7 @@ class MainWindow(QMainWindow):
                 self.play_video()
         self.canvas.update()
 
+    # 保留原有效几何并恢复操作控件，明确显示失败，不以空结果覆盖好配置。
     def on_calibration_failed(self,generation,message):
         if generation!=self.media_generation:return
         backup=getattr(self,'_calibration_backup',None)
@@ -1425,6 +1527,7 @@ class MainWindow(QMainWindow):
         self.calibration_controls(False)
         self.statusBar().showMessage(f"校准未通过：{message}；原识别结果已保留，可再次校准或手动修正")
 
+    # 切换坐标显示，必要时准备可靠几何；不因查看毫米坐标改变播放/暂停状态。
     def toggle_coordinates(self,enabled):
         self.canvas.coordinate_mode=enabled
         self.coordinate_button.setText("坐标模式：开启" if enabled else "坐标模式")
@@ -1437,6 +1540,7 @@ class MainWindow(QMainWindow):
             self.coordinate_readout.setText("坐标模式未开启")
         self.canvas.update()
 
+    # 递增世代并清理选择、轨迹、配准及进球会话；异步回包必须因此失效。
     def invalidate_results(self):
         self.camera_alignment=None;self.camera_geometry=None
         self.close_exam()
@@ -1466,6 +1570,7 @@ class MainWindow(QMainWindow):
         self.pending_all = None
         self.canvas.clear_selection()
 
+    # 按当前来源列表更新上一项/下一项的边界状态和文件名。
     def update_navigation(self):
         images = self.media_mode == "images"
         position=self.image_index if images else self.video_index
@@ -1485,6 +1590,7 @@ class MainWindow(QMainWindow):
         self.update_playback_button()
         self.update_all_button()
 
+    # 先检查索引边界，再切换到目标视频或图片，复用统一失效流程。
     def navigate_media(self,step):
         if self.media_mode=="images":
             self.show_image(self.image_index+step);return
@@ -1496,6 +1602,7 @@ class MainWindow(QMainWindow):
         self.video_index=index;self.video_path=self.video_paths[index]
         self.switch_source(0)
 
+    # 换源前释放旧视频和识别会话，再打开新来源；视频首帧显示后保持暂停。
     def switch_source(self, index):
         self.update_pot_count(clear=True);self.pot_reset_count_on_play=False
         self.timer.stop()
@@ -1533,6 +1640,7 @@ class MainWindow(QMainWindow):
         self.update_navigation()
         if getattr(self,'_calibration_restore_note',None):self.statusBar().showMessage(self._calibration_restore_note)
 
+    # 读取当前样本图片并恢复其配置；读取失败也保持导航可用，不启动视频计时器。
     def show_image(self, index):
         if self.media_mode != "images" or not 0 <= index < len(self.image_paths):
             return
@@ -1556,6 +1664,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"样本图片：{path.name} · " + (self._calibration_restore_note if restored else getattr(self,'_calibration_restore_note',None) or "点击“识别全部”或开启 YOLO 后点选"))
         self.update_navigation()
 
+    # 按需创建/停止 worker 和 QThread；关闭识别与独立进球像素观察分开处理。
     def toggle_yolo(self, enabled):
         self.ball_coordinate_readout.setText("球心：未选择")
         self.yolo_generation += 1
@@ -1606,6 +1715,7 @@ class MainWindow(QMainWindow):
             self.update_all_button()
             self.load_requested.emit()
 
+    # 模型握手完成后恢复识别入口；是否继续提交由当前模式/播放状态决定。
     def on_yolo_ready(self):
         self.yolo_ready = True
         self.yolo_loading = False
@@ -1621,9 +1731,12 @@ class MainWindow(QMainWindow):
         if self.yolo_button.isChecked() and not self.live_active():
             self.statusBar().showMessage("YOLO 已开启，点击视频中的物体；可暂停后选择")
 
+    # 集中判断当前是否满足视频连续推理条件，避免静态图片误进逐帧请求循环。
     def live_active(self):
         return self.media_mode=="video" and self.timer.isActive() and self.yolo_button.isChecked() and (self.detection_mode!="idle" or self.automatic_trails())
 
+    # 同一时间最多保留一个模型请求；忙时不排队，空闲时取当前最新帧。
+    # 记录请求 token、来源世代和帧号，响应返回后才能判断是否仍适用。
     def maybe_submit_live(self):
         if not self.live_active() or not self.yolo_ready or self.yolo_loading or self.yolo_busy or self.canvas.frame is None:
             return
@@ -1650,6 +1763,7 @@ class MainWindow(QMainWindow):
             payload={"frame":payload,"target":targets[0]} if len(targets)==1 else {"frame":payload,"targets":targets}
         self.live_requested.emit(payload,self.live_token)
 
+    # 只在现有几何允许时吸收模型附带的初始台面证据，避免覆盖已有人工/保存基准。
     def adopt_initial_geometry(self,detections):
         if self.canvas.calibration_polygon is not None:return
         table=next((d for d in detections if d.get('calibration_evidence')),None)
@@ -1678,10 +1792,13 @@ class MainWindow(QMainWindow):
         self.refresh_calibration_state()
         self.start_camera_alignment()
 
+    # 核对请求世代后转交初始几何；独立于球体结果显示。
     def on_yolo_geometry(self,generation,table):
         if not self.calibration_busy and generation==self.yolo_generation and self.yolo_button.isChecked():
             self.adopt_initial_geometry([table])
 
+    # 核对 token/来源并把延迟检测对齐到当前帧，再更新选择与轨迹。
+    # 进球逐帧观察已经独立执行，不能将模型回包频率当作视频分析帧率。
     def on_live_result(self,token,detections):
         request=self.live_inflight
         if request is None or token!=request[0]:return
@@ -1712,6 +1829,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"YOLO 实时识别：{len(detections)} 个目标{suffix} · {mode}")
         # The next video tick submits only the newest frame; no FIFO of images.
 
+    # 释放该请求的忙碌状态并提示错误，保留播放主循环可继续工作。
     def on_live_error(self,token,message):
         if self.calibration_busy:return
         request=self.live_inflight
@@ -1723,6 +1841,7 @@ class MainWindow(QMainWindow):
         self.update_all_button()
         if request[1]==self.yolo_generation:self.statusBar().showMessage(f"YOLO 实时识别失败：{message}")
 
+    # 对可命中的已有目标切换选择集合，保留身份 ID，而非按每帧框顺序认球。
     def toggle_target(self,item):
         from src.table_geometry import contains_point
         box=item['box'];cx,cy=(box[0]+box[2])/2,(box[1]+box[3])/2
@@ -1758,6 +1877,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"已选 {len(self.selected_targets)} 个目标 · 再点取消，点其他目标可多选")
         if not self.selected_targets:self.ball_coordinate_readout.setText("未选择目标")
 
+    # 将当前选择映射到最新跟踪检测；跟丢时不把旧框当作持续实测结果。
     def render_live_selection(self):
         self.canvas.show_ball_boxes=self.detection_mode=="all" or self.detection_mode=="single" and not self.automatic_trails()
         if self.automatic_trails():
@@ -1783,14 +1903,17 @@ class MainWindow(QMainWindow):
         if item["name"]=="billiards_table":self.ball_coordinate_readout.setText(f"已选 {len(self.selected_targets)} 个（当前：台球桌）")
         self.canvas.update()
 
+    # 按任务忙碌状态更新袋口入口，避免并行重复检测。
     def update_pocket_button(self):
         self.pocket_button.setText("袋口检测中…" if self.pocket_busy else "自动检测袋口")
         self.pocket_button.setEnabled(self.playback_ready and not self.pocket_busy)
 
+    # 复用当前显式校准入口处理袋口，不为每个视频帧重新定位整桌。
     def detect_pockets(self):
         if self.calibration_busy or not self.playback_ready or self.canvas.frame is None:return
         self.calibrate_table()
 
+    # 只接受当前来源世代的袋口结果，更新画布及依赖该几何的功能状态。
     def on_pocket_result(self, generation, result):
         if self.calibration_busy:return
         self.pocket_busy = False
@@ -1809,6 +1932,7 @@ class MainWindow(QMainWindow):
         self.pocket_button.setToolTip(f"再次点击重新检测。上次结果：{path}\n原因：{reasons}")
         self.statusBar().showMessage(message + f" · JSON：{Path(path).parent.name}/result.json")
 
+    # 当前袋口任务失败时恢复控件并显示原因，不发布一个假成功的六袋结果。
     def on_pocket_error(self, generation, message):
         if self.calibration_busy:return
         self.pocket_busy = False
@@ -1816,6 +1940,7 @@ class MainWindow(QMainWindow):
         if generation == self.media_generation:
             self.statusBar().showMessage(f"袋口检测或保存失败：{message}")
 
+    # 根据来源、模型就绪和当前选择模式同步“全部识别”入口文字/可用性。
     def update_all_button(self):
         if self.calibration_busy:return
         self.update_pocket_button()
@@ -1824,6 +1949,7 @@ class MainWindow(QMainWindow):
         self.identify_all_button.setText("取消识别" if active else "全部识别")
         self.identify_all_button.setEnabled(self.playback_ready and (active or not self.yolo_loading and not self.yolo_busy))
 
+    # 显式切换到整桌识别；播放中走连续模式，静态画面只提交一次请求。
     def identify_all_elements(self):
         if self.calibration_busy:return
         if self.detection_mode=="all":
@@ -1857,12 +1983,14 @@ class MainWindow(QMainWindow):
         else:self.pending_all=(frame,self.yolo_generation)
         self.update_all_button()
 
+    # 设置忙碌状态并复制当前帧发给后台，保证推理对应提交时的画面。
     def submit_all(self, frame, generation):
         self.yolo_busy = True
         self.update_all_button()
         self.statusBar().showMessage("正在识别当前画面中的全部目标…")
         self.identify_all_requested.emit(frame, generation)
 
+    # 核对世代后显示全目标结果；过时响应不更新画布或新的选择。
     def on_yolo_all_result(self, generation, detections):
         if self.calibration_busy:return
         self.yolo_busy = False
@@ -1881,6 +2009,7 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("当前画面未可靠定位台球桌，请换一帧重试")
 
+    # 将有效原图点击坐标与冻结帧交给后台；播放中的选择优先复用已有目标。
     def identify_element(self, frame, x, y):
         if self.calibration_busy:return
         from src.table_geometry import contains_point
@@ -1900,6 +2029,7 @@ class MainWindow(QMainWindow):
         self.ball_coordinate_readout.setText(f"已选 {len(self.selected_targets)} 个 · 正在识别新目标…")
         self.identify_requested.emit(frame,x,y,self.yolo_generation)
 
+    # 核对世代并展示点选名称、框和球心；未命中时显示未识别而非最近球。
     def on_yolo_result(self, generation, name, confidence, box=None, polygon=None):
         if self.calibration_busy:return
         self.selection_busy=False
@@ -1921,6 +2051,7 @@ class MainWindow(QMainWindow):
             self.update_playback_button()
             self.ball_coordinate_readout.setText(f"已选 {len(self.selected_targets)} 个 · 点击处未识别到目标")
 
+    # 清理当前静态请求状态并显示异常，避免错误后按钮永久处于忙碌。
     def on_yolo_error(self, generation, message):
         if self.calibration_busy:return
         self.selection_busy=False;self.resume_after_selection=False
@@ -1938,16 +2069,19 @@ class MainWindow(QMainWindow):
         elif self.yolo_button.isChecked():
             self.statusBar().showMessage("YOLO 已开启，点击视频中的物体；可暂停后选择")
 
+    # 由实际计时器/视频可用状态决定单按钮文字和图标，而非另存易失同步标记。
     def update_playback_button(self):
         playing=self.timer.isActive() or self.resume_after_selection
         self.play_button.setText("暂停" if playing else "播放")
         self.play_button.setAccessibleName("暂停视频" if playing else "播放视频")
         self.play_button.setEnabled(self.media_mode=="video" and self.playback_ready and not self.calibration_busy)
 
+    # 同一入口根据计时器状态调用暂停或播放，保持单按钮行为一致。
     def toggle_playback(self):
         if self.timer.isActive() or self.resume_after_selection:self.pause_video()
         else:self.play_video()
 
+    # 恢复视频时按原规则更新选择和会话；只启动媒体计时器，不同步等待模型推理。
     def play_video(self):
         if self.calibration_busy:return
         if self.pot_reset_count_on_play:
@@ -1976,6 +2110,7 @@ class MainWindow(QMainWindow):
         self.update_playback_button()
         self.statusBar().showMessage(f"本地视频：{self.video_path.name} · 正在播放")
 
+    # 停止解码计时器并刷新按钮；暂停不推进视频时间，也不应增加入袋消失证据。
     def pause_video(self):
         self.resume_after_selection=False
         if self.media_mode == "images" or not self.playback_ready:
@@ -1984,6 +2119,7 @@ class MainWindow(QMainWindow):
         self.update_playback_button()
         self.statusBar().showMessage(f"本地视频：{self.video_path.name} · 已暂停")
 
+    # 视频打开/读取异常的统一界面反馈，禁用依赖不可用视频的操作。
     def show_error(self, message):
         self.timer.stop()
         self.playback_ready = False
@@ -1995,6 +2131,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("图片加载失败" if self.media_mode == "images" else "视频播放失败")
         print(message, file=sys.stderr, flush=True)
 
+    # 主线程逐帧顺序：解码、显示/轨迹更新、相机对齐、进球像素观察，再尝试异步推理。
+    # EOF 回到首帧并暂停，清理过期任务；不能把循环首帧拼接到上一段入袋轨迹。
     def next_frame(self):
         if self.calibration_busy:return
         self.ball_coordinate_readout.setText("球心：未选择")
@@ -2029,6 +2167,7 @@ class MainWindow(QMainWindow):
             if ended_pot_text:self.pot_readout.setText(ended_pot_text)
             self.pot_reset_count_on_play=True
             return
+        # 顺序很重要：先更新当前工作几何，再让本帧实测球进入事件适配器。
         self.update_camera_alignment(frame)
         self.observe_current_pot_frame(frame)
         self.live_frame_id+=1
@@ -2041,6 +2180,8 @@ class MainWindow(QMainWindow):
             self.sync_tracks()
             self.maybe_submit_live()
 
+    # 先停止计时与记录，再关闭模型进程及各工作线程，最后交给 Qt 释放窗口。
+    # 现有 QThread.wait/记录器关闭仍可能等待任务完成，不在本轮注释修改中增加退出超时。
     def closeEvent(self, event):
         self.close_exam()
         self.reset_pot_session("软件关闭")

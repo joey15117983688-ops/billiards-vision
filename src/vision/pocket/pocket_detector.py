@@ -1,4 +1,7 @@
 """One-shot calibration and six local pocket validations; no tracking or scoring."""
+# 一次性台面与六个局部袋口验证，不做跟踪或进球计数。
+# 可以复用调用方同帧拟合的 table；observed/estimated/missing 的来源语义必须保留。
+
 import time
 import cv2
 import numpy as np
@@ -9,11 +12,14 @@ from .pocket_validator import PocketValidator
 
 
 class PocketDetector:
+    # 台面检测器和局部验证器共享同一配置，避免候选方向/尺度不一致。
     def __init__(self, config=None):
         self.config=config or PocketConfig()
         self.table_detector=TableDetector(self.config)
         self.validator=PocketValidator(self.config)
 
+    # 可靠内库确定后展开台面，对标准六袋位置逐一验证；长轴不明时用中袋证据选择方向。
+    # 袋口几何冲突会降为 estimated；只有六袋均 observed 才 valid，不以“数量为六”代表完整实测。
     def detect(self, frame, table=None):
         """Validate pockets, optionally reusing a freshly fitted table from this frame."""
         start=time.perf_counter()

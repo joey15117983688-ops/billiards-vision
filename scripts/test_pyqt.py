@@ -1,4 +1,6 @@
 """Minimal native Qt window. Optional timed close for environment verification."""
+# PyQt5 窗口冒烟测试；可用自动关闭参数验证正常启动/释放，不代表完整业务回归。
+
 import argparse
 import sys
 from pathlib import Path
@@ -9,6 +11,7 @@ from PyQt5.QtCore import QTimer, QT_VERSION_STR, PYQT_VERSION_STR
 from PyQt5.QtWidgets import QApplication, QLabel
 
 
+# 准备 Qt 插件位置并显示简单窗口，指定超时只控制本测试窗口的自动关闭。
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--auto-close-ms", type=int, default=0)

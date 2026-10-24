@@ -1,4 +1,6 @@
 """Create a local macOS app bundle that launches this checkout's virtual environment."""
+# 本地 macOS 启动器安装工具；应用引用当前仓库运行环境，不把机器实际目录写入公开说明。
+
 from pathlib import Path
 import os
 import plistlib
@@ -12,6 +14,7 @@ APP=Path.home()/'Desktop'/'台球视觉识别.app'
 IDENTIFIER='local.joey.billiards-vision'
 
 
+# 生成本地应用图标/启动脚本并指向当前 Python 与 main.py；项目移动后需重新生成入口。
 def main():
     existing=APP/'Contents'/'Info.plist'
     if APP.exists() and (not existing.exists() or plistlib.loads(existing.read_bytes()).get('CFBundleIdentifier')!=IDENTIFIER):

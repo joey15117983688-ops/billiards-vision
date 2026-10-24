@@ -1,4 +1,7 @@
 """Add white-focused training crops; keep validation originals and all visible box labels."""
+# 历史白球局部样本派生脚本；只处理训练划分，不把验证图混入训练。
+# 裁剪是同一原图的派生样本，不是新的独立采集数据；本轮不运行。
+
 from pathlib import Path
 import json
 import shutil
@@ -8,6 +11,7 @@ import yaml
 ROOT=Path(__file__).resolve().parents[1]
 
 
+# 读取已有标注，裁剪训练白球邻域并同步裁剪内其它目标坐标，保留验证划分。
 def main():
     source=ROOT/'data/dataset_white'
     dest=ROOT/'data/dataset_white_focused'

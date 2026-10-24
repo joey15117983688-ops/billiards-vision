@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """Read-only live-input preflight; does not count pots or save calibrations."""
+# 独立流诊断入口，尚不接入主窗口；本地 paced replay 可在无硬件时测试消费/连续性流程。
+# 配置与日志可能含私有连接地址，运行产物只保留本地；不把连接成功当作识别达标。
+
 import argparse
 from dataclasses import asdict
 import json
@@ -18,12 +21,14 @@ from src.camera_alignment import CameraAlignment,map_points
 from src.calibration_state import load_automatic
 
 
+# 给本地视频读取加节奏，模拟持续生产者，属于测试回放而非现场摄像头。
 class PacedReplay:
     """A local file acting like a paced camera; only for preflight tests."""
     def __init__(self,path):
         self.capture=cv2.VideoCapture(str(path));self.deadline=time.monotonic()
         fps=self.capture.get(cv2.CAP_PROP_FPS);self.period=1/(fps if 1<=fps<=120 else 30)
     def isOpened(self):return self.capture.isOpened()
+    # 按既定时间节奏读取原片，保留真实帧内容，不生成检测/入袋结果。
     def read(self):
         remaining=self.deadline-time.monotonic()
         if remaining>0:time.sleep(remaining)
@@ -32,6 +37,7 @@ class PacedReplay:
     def release(self):self.capture.release()
 
 
+# 读取明确的来源、源标识与诊断参数，不自动发现或连接未知设备。
 def arguments():
     p=argparse.ArgumentParser(description='实时输入前期诊断：不改主程序、不保存校准、不判进球')
     p.add_argument('--camera-id',required=True,help='稳定的球房／球桌／摄像机标识，与拉流地址无关')
@@ -50,6 +56,7 @@ def arguments():
     return args
 
 
+# 独立启动最新帧流并评估预检状态，最后回收读取器，输出仅作为前期准备诊断。
 def run(args):
     source=os.environ[args.stream_env] if args.stream_env else str(args.video)
     config=LiveSourceConfig(args.camera_id,source)

@@ -1,4 +1,8 @@
 """Public inputs use one table plane; distances are fractions of its short side."""
+# 事件公共数据契约。State 是离散状态，不是置信概率；UNKNOWN 必须保留供人工复核。
+# EventConfig 的时间为视频秒、速度/距离为归一化事件平面单位；BallObservation 是实测输入。
+# BallState 保存证据与历史，PocketEvent 是可序列化裁决，WHITE_BALL_POTTED 只是输出信号区别。
+
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 
@@ -58,4 +62,5 @@ class PocketEvent:
     confidence_status: str
     signal: str
 
+    # 将 dataclass 递归转为可写入 JSON 的事件结构，保留 reason/evidence 便于复核。
     def to_dict(self):return asdict(self)

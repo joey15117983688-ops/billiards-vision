@@ -1,9 +1,14 @@
 """Find a plausible cloth quadrilateral and fit inner cushion boundary lines, without YOLO."""
+# 台面定位：颜色连通轮廓生成候选，再用内库直线、面积、透视及边界支持筛选。
+# 图像可缩小计算，但最终四角仍还原到原图像素；几何质量分数是启发式而非概率。
+# 现有全局 HSV 仍可能被彩灯改变；可靠标记也不能替代固定机位/光照质量保护。
+
 import cv2
 import numpy as np
 from .models import PocketConfig, TableResult
 
 
+# 以两个点构造单位法向式直线 ax+by+c=0，供内库边线求交使用。
 def _line(a, b):
     delta = b-a
     vector = np.array([delta[1], -delta[0]], float)
@@ -11,6 +16,7 @@ def _line(a, b):
     return np.r_[vector, -vector@a]
 
 
+# 求两条直线交点；接近平行时返回 None，避免生成极远的伪角点。
 def _intersection(a, b):
     determinant = a[0]*b[1]-b[0]*a[1]
     if abs(determinant) < 1e-6:
@@ -20,9 +26,13 @@ def _intersection(a, b):
 
 
 class TableDetector:
+    # 保存检测配置，调用方可复用同一配置对比不同帧，而不修改全局参数。
     def __init__(self, config=None):
         self.config = config or PocketConfig()
 
+    # 校验 BGR uint8 图像；分开评估主色候选以免把蓝地毯与绿台呢合成一张桌。
+    # 轮廓凸四边形通过形状约束后，再用 Hough 直线及内侧亮度/边缘支持拟合内库。
+    # 输入无效或证据不充分时返回带原因的 TableResult，供上层保守回退，不强凑四角。
     def detect(self, frame):
         if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[2] != 3 or frame.dtype != np.uint8 or min(frame.shape[:2]) < 32:
             return TableResult(reasons=['invalid_bgr_frame'])

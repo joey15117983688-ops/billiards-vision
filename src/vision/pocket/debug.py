@@ -1,4 +1,7 @@
 """Save calibration data and independent debug images; does not alter a detector/model."""
+# 本地调试图与 JSON 导出；只表现检测结果，不参与候选接受或进球判定。
+# 图片含现场画面，运行产物保存在被忽略的 data/debug 目录，不默认公开上传。
+
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -10,6 +13,7 @@ import numpy as np
 COLORS={'observed':(40,210,40),'estimated':(0,210,255),'missing':(40,40,240)}
 
 
+# 用 OpenCV Hershey 字体绘制调试标签（非 Qt 中文排版），不把文字转换为识别输入。
 def _label(image,text,point,color):
     x,y=map(int,point)
     (width,height),_=cv2.getTextSize(text,cv2.FONT_HERSHEY_SIMPLEX,.45,1)
@@ -19,6 +23,7 @@ def _label(image,text,point,color):
     cv2.putText(image,text,(x+2,y),cv2.FONT_HERSHEY_SIMPLEX,.45,color,1,cv2.LINE_AA)
 
 
+# 在原图副本上按状态绘制台面、袋口和入口，保留源图不被涂改。
 def visualize(frame,result,mode='final'):
     image=frame.copy()
     if result.table.corners:
@@ -49,6 +54,7 @@ def visualize(frame,result,mode='final'):
     return image
 
 
+# 保存原图、掩模、展开图、叠加图和结构化 JSON，便于人工追踪失败原因。
 def save_debug_result(frame,result,folder):
     folder=Path(folder);folder.mkdir(parents=True,exist_ok=True)
     outputs={'original':frame,'table_mask':result.table_mask,'pocket_regions':result.pocket_mask,

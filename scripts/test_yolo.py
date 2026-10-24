@@ -1,4 +1,6 @@
 """Load an official nano model and infer on one ordinary test image."""
+# 通用 YOLO 安装冒烟测试，与业务部署权重验证分开；首次加载公共模型可能触发下载。
+
 import os
 from pathlib import Path
 
@@ -11,6 +13,7 @@ os.environ.setdefault("YOLO_AUTOINSTALL", "false")
 from ultralytics import YOLO
 
 
+# 用现有测试图片运行普通 CPU 推理，验证库能工作；没检测到台球不代表安装失败。
 def main():
     image = ROOT / "data" / "opencv_test.jpg"
     if not image.exists():

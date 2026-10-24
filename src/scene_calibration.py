@@ -1,7 +1,13 @@
 """Rebuild table, pocket and ball observations from one fresh frame."""
+# 单张新鲜帧上的校准协调入口；几何、识别范围与球体检测分层返回。
+# 人工确认、显式自动纠错和普通模型检测是不同来源，不能把一种来源伪装成另一种。
+
 from copy import deepcopy
 
 
+# 优先使用没有纠错请求的人工配置，否则搜索并比较候选；geometry_only 跳过球体推理。
+# 内库 polygon 用于坐标和袋口，scope_polygon 用于显示/过滤相连库边，两者不可互换。
+# 纠错为 unchanged 时尽量保留之前范围和袋口，最终返回报告说明是否真正发生替换。
 def calibrate_scene(frame, predict, progress, manual_profile=None, correction_context=None, geometry_only=False):
     progress('2/4 重新定位台呢与内库边界…')
     report=None
